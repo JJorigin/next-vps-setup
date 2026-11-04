@@ -67,12 +67,17 @@ class OfficialAptViewTests(unittest.TestCase):
         self.view = Path(str(self.base) + "-apt")
         # Ubuntu WSL need not have Debian keys: a fixture keyring is sufficient
         # for config/URI preview tests, which never authenticate or download.
-        self.keyring = self.root / "debian-archive-keyring.gpg"
-        self.keyring.write_text("synthetic keyring; no download allowed\n")
-        self.keyring.chmod(0o644)
+        self.keyring_dir = self.root / "keyrings"
+        self.keyring_dir.mkdir(mode=0o755)
+        self.keyring = self.keyring_dir / "debian-archive-keyring.gpg"
+        self.keyring_target = self.keyring_dir / "debian-archive-keyring.pgp"
+        self.keyring_target.write_text("synthetic keyring; no download allowed\n")
+        self.keyring_target.chmod(0o644)
+        # Debian 13's real package layout: .gpg is a compatibility symlink.
+        self.keyring.symlink_to(self.keyring_target.name)
         self.library = self.root / "official-apt-fixture.sh"
         self.library.write_text(LIBRARY.read_text().replace(
-            "/usr/share/keyrings/debian-archive-keyring.gpg", str(self.keyring)
+            "/usr/share/keyrings", str(self.keyring_dir)
         ), encoding="utf-8")
         self.host = self.root / "host"
         self.host.mkdir()
@@ -103,7 +108,8 @@ die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
 declare -A S=([task_id]="$TASK_ID")
 BASE=$FIXTURE_ROOT/task
 stat() {
-    if [[ ${1:-} == -c && ${2:-} == %u && ${!#} == "$FIXTURE_ROOT"* ]]; then printf '0\n'
+    if [[ ${1:-} == -c && ${2:-} == %u && ${!#} == "$FIXTURE_ROOT"* ]]; then
+        if [[ ${!#} == "${FIXTURE_NONROOT_PATH:-}" ]]; then printf '12345\n'; else printf '0\n'; fi
     else command stat "$@"; fi
 }
 '''
@@ -263,6 +269,67 @@ official_apt_exec /usr/bin/env
                 self.keyring.chmod(mode)
                 self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
         self.keyring.chmod(0o644)
+
+    def test_official_keyring_compatibility_symlink_is_accepted(self) -> None:
+        self.assertTrue(self.keyring.is_symlink())
+        self.run_shell("check_sources; official_apt_prepare")
+        self.assertIn(str(self.keyring), (self.view / "official.sources").read_text())
+
+    def test_legacy_regular_keyring_is_still_accepted(self) -> None:
+        self.keyring.unlink()
+        self.keyring.write_bytes(self.keyring_target.read_bytes())
+        self.keyring.chmod(0o644)
+        self.run_shell("check_sources; official_apt_prepare")
+
+    def test_absolute_direct_link_to_the_official_pgp_is_accepted(self) -> None:
+        self.keyring.unlink()
+        self.keyring.symlink_to(self.keyring_target)
+        self.run_shell("check_sources")
+
+    def test_arbitrary_keyring_link_targets_are_rejected(self) -> None:
+        other = self.keyring_dir / "other.gpg"
+        other.write_bytes(self.keyring_target.read_bytes())
+        for target in (other.name, str(other), "../keyrings/debian-archive-keyring.pgp"):
+            with self.subTest(target=target):
+                self.keyring.unlink()
+                self.keyring.symlink_to(target)
+                self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
+
+    def test_nonroot_owned_keyring_link_or_target_is_rejected(self) -> None:
+        for path in (self.keyring, self.keyring_target):
+            with self.subTest(path=path.name):
+                proc = self.run_shell(
+                    f"FIXTURE_NONROOT_PATH={shlex.quote(str(path))}; check_sources", check=False
+                )
+                self.assertNotEqual(proc.returncode, 0)
+
+    def test_empty_or_missing_keyring_target_is_rejected(self) -> None:
+        self.keyring_target.write_bytes(b"")
+        self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
+        self.keyring_target.unlink()
+        self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
+
+    def test_keyring_link_chain_is_rejected(self) -> None:
+        other = self.keyring_dir / "other.gpg"
+        other.write_bytes(self.keyring_target.read_bytes())
+        self.keyring_target.unlink()
+        self.keyring_target.symlink_to(other.name)
+        self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
+
+    def test_keyring_package_layout_upgrade_keeps_private_configuration_unchanged(self) -> None:
+        self.keyring.unlink()
+        self.keyring.write_bytes(self.keyring_target.read_bytes())
+        self.keyring.chmod(0o644)
+        self.run_shell("official_apt_prepare")
+        before = {name: (self.view / name).read_bytes() for name in ("apt.conf", "official.sources")}
+        self.keyring.unlink()
+        self.keyring.symlink_to(self.keyring_target.name)
+        self.run_shell("official_apt_prepare")
+        self.assertEqual(before, {name: (self.view / name).read_bytes() for name in before})
+
+    def test_writable_keyring_directory_is_rejected(self) -> None:
+        self.keyring_dir.chmod(0o777)
+        self.assertNotEqual(self.run_shell("check_sources", check=False).returncode, 0)
 
     def test_partial_cleanup_failure_preserves_owner_and_can_rebuild(self) -> None:
         self.run_shell("official_apt_prepare")

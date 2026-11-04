@@ -38,7 +38,7 @@ def inventory(*extra: str) -> str:
 
 def valid_state() -> dict[str, str]:
     return {
-        "format": "1", "version": "1.1", "task_id": BEFORE,
+        "format": "1", "version": "1.1.1", "task_id": BEFORE,
         "machine_id": "a" * 32, "phase": "install", "failed": "no",
         "result_status": "running", "meta": META, "meta_version": "-",
         "target_pkg": "-", "target_abi": "-", "target_version": "-",

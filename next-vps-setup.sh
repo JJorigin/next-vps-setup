@@ -1,5 +1,5 @@
 #!/bin/bash
-# next-vps-setup v1.1 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v1.1.1 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
@@ -30,7 +30,7 @@ SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
 SWAP_BYTES=1073741824
 SWAP_RESERVE_KIB=1048576
-VERSION=1.1
+VERSION=1.1.1
 declare -A S=()
 IN_REBOOT=no
 
@@ -587,12 +587,30 @@ official_apt_dir_ok() {
     [[ $uid == 0 || ( ${2:-root} == download && $uid == "$apt_uid" ) ]] || return 1
     if [[ ${2:-root} == download ]]; then [[ $mode == 755 || $mode == 700 ]]; else [[ $mode == 755 ]]; fi
 }
+official_apt_keyring_target() {
+    local keyring=/usr/share/keyrings/debian-archive-keyring.gpg target link
+    target=$keyring
+    official_apt_dir_ok "${keyring%/*}" || return 1
+    if [[ -L $keyring ]]; then
+        # Debian 13 ships this one compatibility link. Other APT files remain
+        # subject to the no-symlink rule in official_apt_file_ok.
+        [[ $(stat -c %u -- "$keyring") == 0 ]] || return 1
+        link=$(readlink -- "$keyring") || return 1
+        case $link in
+            debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.pgp)
+                target=/usr/share/keyrings/debian-archive-keyring.pgp ;;
+            *) return 1 ;;
+        esac
+    fi
+    official_apt_file_ok "$target" && [[ -s $target && -r $target && $(readlink -e -- "$target") == "$target" ]] || return 1
+    printf '%s\n' "$target"
+}
 check_sources() {
+    local keyring
     # Host source files, pins and APT hooks are neither loaded nor changed.
-    official_apt_file_ok /usr/share/keyrings/debian-archive-keyring.gpg &&
-        [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]] || die '缺少可读取的 Debian 官方签名密钥文件，请先检查系统完整性。'
-    (( (8#$(stat -c %a -- /usr/share/keyrings/debian-archive-keyring.gpg) & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
     id -u _apt >/dev/null 2>&1 || die '系统缺少 APT 下载沙箱用户，请先修复基础软件包。'
+    keyring=$(official_apt_keyring_target) || die 'Debian 官方密钥文件缺失、权限异常或链接目标不受支持，请保留 ls -l /usr/share/keyrings/debian-archive-keyring.* 的输出供排查。'
+    (( (8#$(stat -c %a -- "$keyring") & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
     [[ $BASE =~ ^/[a-zA-Z0-9_./-]+$ ]] || die 'Unsafe private APT path.'
 }
 official_apt_sources_content() {
@@ -845,11 +863,11 @@ swap_owner_content() {
     printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "$SWAP_BYTES"
 }
 swap_unit_content() {
-    printf '%s\n' '# Managed by next-vps-setup v1.1' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
+    printf '%s\n' '# Managed by next-vps-setup v1.1.1' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
         '' '[Swap]' "What=$SWAP_FILE" 'Priority=10' 'TimeoutSec=90s' \
         '' '[Install]' 'WantedBy=swap.target'
 }
-swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.1' 'vm.swappiness = 10'; }
+swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.1.1' 'vm.swappiness = 10'; }
 swap_mount_field() {
     local value
     value=$(findmnt --raw --noheadings --first-only --output "$1" --target /var/lib) || die 'Cannot inspect the Swap filesystem.'
@@ -1022,7 +1040,7 @@ publish_config() {
 }
 jail_content() {
     cat <<'JAIL_HEADER'
-# Managed by next-vps-setup v1.1
+# Managed by next-vps-setup v1.1.1
 [sshd]
 enabled = true
 JAIL_HEADER
@@ -1037,7 +1055,7 @@ bantime = -1
 action = nftables[type=multiport, name=sshd, port="%(port)s", protocol=tcp, table=f2b-next-vps-setup]
 JAIL_BODY
 }
-balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.1' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
+balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.1.1' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
 configure_hostname() {
     if [[ $(hostnamectl --static) != "${S[hostname]}" ]]; then hostnamectl set-hostname "${S[hostname]}"; dirty; fi
     if ! getent hosts "${S[hostname]}" >/dev/null; then

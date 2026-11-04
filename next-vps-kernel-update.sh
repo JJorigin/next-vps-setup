@@ -1,9 +1,9 @@
 #!/bin/bash
-# next-vps-kernel-update 1.1 -- Debian 13 official-kernel maintenance.
+# next-vps-kernel-update 1.1.1 -- Debian 13 official-kernel maintenance.
 # Save under /root; run with bash and an absolute path. No network tuning.
 # Functions may be sourced by the isolated test harness; main is not then run.
 
-VERSION=1.1
+VERSION=1.1.1
 BASE=/var/lib/next-vps-kernel-update
 STATE=$BASE/state.tsv
 WORKER=$BASE/worker.sh
@@ -596,12 +596,30 @@ official_apt_dir_ok() {
     [[ $uid == 0 || ( ${2:-root} == download && $uid == "$apt_uid" ) ]] || return 1
     if [[ ${2:-root} == download ]]; then [[ $mode == 755 || $mode == 700 ]]; else [[ $mode == 755 ]]; fi
 }
+official_apt_keyring_target() {
+    local keyring=/usr/share/keyrings/debian-archive-keyring.gpg target link
+    target=$keyring
+    official_apt_dir_ok "${keyring%/*}" || return 1
+    if [[ -L $keyring ]]; then
+        # Debian 13 ships this one compatibility link. Other APT files remain
+        # subject to the no-symlink rule in official_apt_file_ok.
+        [[ $(stat -c %u -- "$keyring") == 0 ]] || return 1
+        link=$(readlink -- "$keyring") || return 1
+        case $link in
+            debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.pgp)
+                target=/usr/share/keyrings/debian-archive-keyring.pgp ;;
+            *) return 1 ;;
+        esac
+    fi
+    official_apt_file_ok "$target" && [[ -s $target && -r $target && $(readlink -e -- "$target") == "$target" ]] || return 1
+    printf '%s\n' "$target"
+}
 check_sources() {
+    local keyring
     # Host source files, pins and APT hooks are neither loaded nor changed.
-    official_apt_file_ok /usr/share/keyrings/debian-archive-keyring.gpg &&
-        [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]] || die '缺少可读取的 Debian 官方签名密钥文件，请先检查系统完整性。'
-    (( (8#$(stat -c %a -- /usr/share/keyrings/debian-archive-keyring.gpg) & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
     id -u _apt >/dev/null 2>&1 || die '系统缺少 APT 下载沙箱用户，请先修复基础软件包。'
+    keyring=$(official_apt_keyring_target) || die 'Debian 官方密钥文件缺失、权限异常或链接目标不受支持，请保留 ls -l /usr/share/keyrings/debian-archive-keyring.* 的输出供排查。'
+    (( (8#$(stat -c %a -- "$keyring") & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
     [[ $BASE =~ ^/[a-zA-Z0-9_./-]+$ ]] || die 'Unsafe private APT path.'
 }
 official_apt_sources_content() {

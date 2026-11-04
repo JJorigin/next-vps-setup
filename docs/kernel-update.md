@@ -1,6 +1,6 @@
 # Debian 13 内核维护
 
-`next-vps-kernel-update.sh` 1.1 是 `next-vps-setup` 的配套工具，用于完成初始化后的内核更新。
+`next-vps-kernel-update.sh` 1.1.1 是 `next-vps-setup` 的配套工具，用于完成初始化后的内核更新。
 
 它保留原来的cloud／标准amd64系列，更新Debian官方稳定源内核，自动重启一次，核验后清理旧版本，只保留本次目标内核和原系列元包。原初始化配置和结果文件保留。
 
@@ -23,7 +23,7 @@ GitHub：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1/next-vps-kernel-update.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1.1/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -34,7 +34,7 @@ jsDelivr：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@fe2fc082435892a4d76fa87f51c0871ff49faf01/next-vps-kernel-update.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.1.1/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -99,6 +99,8 @@ apt-get check
 `dpkg --audit` 正常无输出，`apt-get check` 应无依赖错误。也请实际连接业务服务，确认正常使用。
 
 ## 失败后恢复
+
+如果使用1.1时，在 `--check` 阶段提示“缺少可读取的 Debian 官方签名密钥文件”，请按上方命令下载1.1.1后重新检查。这是旧版对Debian官方兼容链接的误判；仅在检查阶段停止时，尚未开始升级任务，检查通过后可正常开始，无需 `--resume`。不要因此修改或删除系统密钥文件。
 
 先保留状态和日志，不要反复开始新任务或手工删除内核文件。查看日志：
 

@@ -1,6 +1,6 @@
 # next-vps-setup
 
-**1.1 · 一键 VPS 初始化，适用于 Debian 13。**
+**1.1.1 · 一键 VPS 初始化，适用于 Debian 13。**
 
 首次安装用 `next-vps-setup.sh`；以后更新内核，用配套的 `next-vps-kernel-update.sh`。
 
@@ -45,7 +45,7 @@ GitHub：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1/next-vps-setup.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1.1/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
@@ -56,7 +56,7 @@ jsDelivr：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@fe2fc082435892a4d76fa87f51c0871ff49faf01/next-vps-setup.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.1.1/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
@@ -98,7 +98,7 @@ cat /var/lib/next-vps-setup-result.tsv
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1/next-vps-kernel-update.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1.1/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -142,5 +142,5 @@ bash /root/next-vps-kernel-update.sh --resume
 - Fail2ban只管理自己的封禁规则，不启用整套本机防火墙，不清空现有规则。
 - 不做全局 `autoremove`，不清除正常系统日志。
 - 初始化结果记录当时状态；后续内核维护另存结果，不改写原初始化结果。
-- 下载链接固定为1.1，已有1.0发布保持不变。新版本不能接管其他版本尚未完成的任务。
+- 下载链接固定为1.1.1，既有发布保持不变。新版本不能接管其他版本尚未完成的任务。
 - 本地测试不能代替真实VPS验证，首次使用建议选择可恢复的机器。[开发验证范围](docs/kernel-update-audit.md)
