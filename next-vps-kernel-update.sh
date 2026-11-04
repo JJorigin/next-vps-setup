@@ -740,16 +740,30 @@ official_apt_exec() {
 }
 apt_run() { official_apt_prepare; official_apt_exec apt-get "$@"; }
 apt_cache() { official_apt_prepare; official_apt_exec apt-cache "$@"; }
+official_apt_empty_packages() {
+    # APT omits Packages when the authenticated InRelease declares it empty.
+    # This is a readiness check only; signature verification remains with APT.
+    awk '
+        $0=="SHA256:" {in_sha=1; next}
+        /^[^[:space:]]/ {in_sha=0}
+        in_sha && NF==3 && $3=="main/binary-amd64/Packages" {
+            count++
+            if($1=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" && $2=="0") empty++
+        }
+        END {exit !(count==1 && empty==1)}' "$1"
+}
 official_apt_ready() {
     local root prefix file found
     root=$(official_apt_root)
-    for prefix in deb.debian.org_debian_dists_trixie security.debian.org_debian-security_dists_trixie-security; do
+    for prefix in deb.debian.org_debian_dists_trixie deb.debian.org_debian_dists_trixie-updates security.debian.org_debian-security_dists_trixie-security; do
         [[ -s $root/lists/${prefix}_InRelease ]] || return 1
         found=no
         for file in "$root/lists/${prefix}_main_binary-amd64_Packages" "$root/lists/${prefix}_main_binary-amd64_Packages."*; do
             [[ ! -s $file ]] || found=yes
         done
-        [[ $found == yes ]] || return 1
+        if [[ $found != yes ]]; then
+            official_apt_empty_packages "$root/lists/${prefix}_InRelease" || return 1
+        fi
     done
 }
 check_origins() {

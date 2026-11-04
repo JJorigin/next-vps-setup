@@ -23,6 +23,11 @@ SCRIPTS = (PROJECT / "next-vps-setup.sh", PROJECT / "next-vps-kernel-update.sh")
 BEGIN = "# BEGIN NEXT-VPS OFFICIAL APT VIEW"
 END = "# END NEXT-VPS OFFICIAL APT VIEW"
 TASK = "11111111-1111-4111-8111-111111111111"
+INDEX_PREFIXES = (
+    "deb.debian.org_debian_dists_trixie",
+    "deb.debian.org_debian_dists_trixie-updates",
+    "security.debian.org_debian-security_dists_trixie-security",
+)
 
 
 class OfficialAptSourceTests(unittest.TestCase):
@@ -295,23 +300,72 @@ apt_cache policy synthetic-package
         self.assertIn("policy synthetic-package", proc.stdout)
 
     def test_recovery_refreshes_missing_indexes_only(self) -> None:
-        self.run_shell(r'''
+        proc = self.run_shell(r'''
 official_apt_prepare
 strict_update() { printf 'REFRESH\n'; }
 official_apt_recover_indexes
 ''')
-        for name in (
-            "deb.debian.org_debian_dists_trixie_InRelease",
-            "security.debian.org_debian-security_dists_trixie-security_InRelease",
-            "deb.debian.org_debian_dists_trixie_main_binary-amd64_Packages.lz4",
-            "security.debian.org_debian-security_dists_trixie-security_main_binary-amd64_Packages.lz4",
-        ):
-            (self.view / "lists" / name).write_text("synthetic index\n")
+        self.assertIn("REFRESH", proc.stdout)
+        self.complete_index_fixture()
         proc = self.run_shell(r'''
 strict_update() { printf 'SHOULD_NOT_REFRESH\n'; return 91; }
 official_apt_recover_indexes
 ''')
         self.assertNotIn("SHOULD_NOT_REFRESH", proc.stdout)
+
+    def complete_index_fixture(self) -> None:
+        self.run_shell("official_apt_prepare")
+        for prefix in INDEX_PREFIXES:
+            (self.view / "lists" / f"{prefix}_InRelease").write_text("synthetic index\n")
+            (self.view / "lists" / f"{prefix}_main_binary-amd64_Packages.lz4").write_text("synthetic index\n")
+
+    def test_missing_updates_release_refreshes_even_when_other_suites_remain(self) -> None:
+        self.complete_index_fixture()
+        (self.view / "lists" / f"{INDEX_PREFIXES[1]}_InRelease").unlink()
+        proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
+        self.assertIn("REFRESH", proc.stdout)
+
+    def test_missing_updates_packages_refreshes_even_when_other_suites_remain(self) -> None:
+        self.complete_index_fixture()
+        (self.view / "lists" / f"{INDEX_PREFIXES[1]}_main_binary-amd64_Packages.lz4").unlink()
+        proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
+        self.assertIn("REFRESH", proc.stdout)
+
+    def test_release_declared_empty_packages_need_no_local_index_file(self) -> None:
+        self.complete_index_fixture()
+        prefix = INDEX_PREFIXES[1]
+        (self.view / "lists" / f"{prefix}_main_binary-amd64_Packages.lz4").unlink()
+        release = self.view / "lists" / f"{prefix}_InRelease"
+        release.write_text(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nSHA256:\n"
+            " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n"
+            "-----BEGIN PGP SIGNATURE-----\nsynthetic signature; readiness only\n"
+        )
+        proc = self.run_shell("strict_update() { printf 'UNEXPECTED_REFRESH\\n'; return 91; }; official_apt_recover_indexes")
+        self.assertNotIn("UNEXPECTED_REFRESH", proc.stdout)
+        # APT may also leave a zero-byte uncompressed copy; it is still empty.
+        (self.view / "lists" / f"{prefix}_main_binary-amd64_Packages").touch()
+        self.run_shell("official_apt_ready")
+
+    def test_zero_byte_index_without_matching_empty_sha256_requires_refresh(self) -> None:
+        self.complete_index_fixture()
+        prefix = INDEX_PREFIXES[1]
+        package = self.view / "lists" / f"{prefix}_main_binary-amd64_Packages.lz4"
+        package.write_bytes(b"")
+        release = self.view / "lists" / f"{prefix}_InRelease"
+        empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        for text in (
+            f"SHA256:\n {'a' * 64} 0 main/binary-amd64/Packages\n",
+            f"SHA256:\n {empty_hash} 1 main/binary-amd64/Packages\n",
+            f"SHA256:\n {empty_hash} 0 main/binary-arm64/Packages\n",
+            f"SHA512:\n {empty_hash} 0 main/binary-amd64/Packages\n",
+            f"SHA256:\nOther:\n {empty_hash} 0 main/binary-amd64/Packages\n",
+            f"SHA256:\n {empty_hash} 0 main/binary-amd64/Packages\n {'a' * 64} 1 main/binary-amd64/Packages\n",
+        ):
+            with self.subTest(release=text):
+                release.write_text(text)
+                proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
+                self.assertIn("REFRESH", proc.stdout)
 
 
 if __name__ == "__main__":
