@@ -1,139 +1,146 @@
 # next-vps-setup
 
-**1.0 · Debian 13 VPS 基础初始化**
+**1.1 · 一键 VPS 初始化，适用于 Debian 13。**
 
-适合刚重装、已经能正常 SSH 登录的 VPS。输入机器名和当前 SSH 端口后，脚本会在后台完成更新、基础配置、重启验证和任务清理。
+首次安装用 `next-vps-setup.sh`；以后更新内核，用配套的 `next-vps-kernel-update.sh`。
 
-## 功能
+| 工具 | 什么时候使用 | 完成什么 |
+|---|---|---|
+| [系统初始化](#首次初始化) | 刚重装系统、尚未安装业务服务 | 官方更新、基础配置、SSH防护和重启检查 |
+| [内核维护](#后续内核维护) | 已完成本项目初始化，需要更新内核 | 更新官方内核，重启检查后清理旧内核 |
 
-| 项目 | 默认设置 |
-|---|---|
-| 系统更新 | 更新官方软件包及 Debian 13 官方稳定源当前最新内核，保留原 cloud／标准 amd64 系列 |
-| SSH | 保留现有账号、密码、端口和认证方式；输入端口仅用于核验 |
-| 主机名 | 运行时自行填写 |
-| 时区 | 马来西亚 `Asia/Kuala_Lumpur`，UTC+8 |
-| 时间同步 | 尽力启用；无法同步时记录警告，继续其他步骤 |
-| SSH 防护 | Fail2ban：同一来源在10分钟内匹配5次失败事件，永久封禁 |
-| 气球驱动 | 对模块式驱动禁止加载并重启验证；遇到内建驱动会停止并提示 |
-| 小内存 Swap | 实际内存 **≤1GiB**：创建 **1GiB 磁盘 Swap**，`swappiness=10`、优先级10 |
-| 大内存 | 实际内存 **>1GiB**：不新建 Swap，不修改已有 Swap 和 swappiness |
-| 完成清理 | 清理本次执行文件、后台任务及临时日志，保留持久配置和结果摘要 |
-
-内存按系统的 `MemTotal` 判断。标称1GB、系统实际可见约968MiB的机器会创建 Swap。小内存机器先启用 Swap，再进行软件更新。
+两个工具均保留原来的 cloud／标准 amd64 内核系列，不使用第三方内核。已有其他 APT 源可以保留；任务使用独立的 Debian 官方源进行更新，不修改现有源文件。已安装的第三方软件仍需自行确认兼容性。有签名也不代表第三方软件一定安全；如果装过不可信软件，建议重装干净系统。
 
 ## 使用要求
 
-- 新装 **Debian 13、amd64、systemd 虚拟机**，使用 Debian 官方软件源。
-- 使用 root，当前 SSH 连接正常，商家防火墙已放行该端口。
-- 创建 Swap 要求本地可写 **ext4**；已有 Swap 或冲突配置时停止，不自动覆盖。
-- 初始根分区至少2GiB空闲、`/boot`至少200MiB空闲，并有128MiB可用内存；Swap所在分区需容纳1GiB文件并留1GiB余量。
+- Debian 13、amd64、systemd 虚拟机，使用 root。
+- 当前 SSH 登录正常，商家防火墙已放行对应端口。
+- 操作前备份重要数据，并确认能使用商家控制台。
 
-请在安装业务服务前使用。此版本不用于升级已有部署，不支持容器、NAT外部端口映射、多SSH监听端口或已有自定义Fail2ban配置。
+初始化仅用于新系统，不用于重新初始化已经部署业务的机器。不支持容器、NAT外部端口映射、多SSH监听端口或已有自定义Fail2ban配置。
 
-## 开始使用
+## 首次初始化
 
-先安装下载工具，已有时可跳过：
+初始化会完成以下设置：
 
-```bash
-apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
-```
+| 项目 | 设置 |
+|---|---|
+| 官方更新 | 更新 Debian 官方软件包及稳定源当前最新内核 |
+| SSH | 保留账号、密码、端口和认证方式；输入端口仅用于核验 |
+| 主机名 | 运行时自行填写 |
+| 时区 | 马来西亚 `Asia/Kuala_Lumpur`，UTC+8 |
+| 时间同步 | 尽力启用，无法同步时警告并继续 |
+| SSH防护 | Fail2ban：同一来源10分钟内匹配5次失败事件，永久封禁 |
+| 气球驱动 | 禁止模块式驱动加载并重启检查；内建驱动无法处理时停止 |
+| 实际内存≤1GiB | 创建1GiB磁盘Swap，`swappiness=10`、优先级10 |
+| 实际内存>1GiB | 不新建Swap，不接管已有内存策略 |
 
-下面两种下载方式任选一种。请只执行一次，**安装进行中不要重新下载或替换脚本**。
+内存按 `MemTotal` 判断。创建Swap要求本地可写ext4；已有Swap或冲突配置时停止，不自动覆盖。初始根分区需至少2GiB空闲、`/boot` 至少200MiB空闲、可用内存至少128MiB；Swap所在分区还需容纳1GiB文件并保留1GiB余量。
 
-### GitHub
+### 下载并运行
+
+下面两种方式任选一种。**任务进行期间不要重复下载、替换脚本或同时执行系统升级。**
+
+GitHub：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/v1.0/next-vps-setup.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/v1.1/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
-### jsDelivr
+jsDelivr：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@v1.0/next-vps-setup.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@v1.1/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
-也可以从仓库下载 `next-vps-setup.sh`，上传到 `/root/next-vps-setup.sh` 后执行：
+没有 `curl` 时，也可以下载本仓库的 `next-vps-setup.sh`，上传到 `/root/next-vps-setup.sh`，再执行：
 
 ```bash
 chmod 700 /root/next-vps-setup.sh
 bash /root/next-vps-setup.sh
 ```
 
-脚本需要保存为本地文件，以便重启后续行。请勿使用 `curl | bash` 或进程替换方式运行。
+请保存为本地文件后执行，不要使用 `curl | bash` 或进程替换。
 
-## 运行后会发生什么
+### 等待并查看结果
 
-1. 输入本机机器名和**当前实际 SSH 端口**。脚本不会修改登录密码或端口。
-2. 通过检查后，任务交给 systemd 在后台执行。
-3. 必要时自动重启并继续，SSH 会断开。**SSH 不会自动重连，需要手动连接。**
-4. 首次断线后，可先等待约 **5～10分钟**再连接查询；下载或更新较慢时会更久，期间可能再次重启。
+输入机器名和当前SSH端口后，任务会在后台继续。期间可能重启多次，SSH会断开，**需要手动重新连接**。首次断线后可先等待约5～10分钟；下载或更新较慢时需要更久。
 
-重新连接成功不代表任务已经完成，请查看结果。
-
-## 查看进度与结果
-
-执行期间查看状态：
-
-```bash
-bash /root/next-vps-setup.sh --status
-```
-
-查看运行日志：
-
-```bash
-tail -n 80 /var/lib/next-vps-setup/next-vps-setup.log
-```
-
-查看最终结果：
+后台任务完成或失败后，下次通过SSH以root交互登录时会显示一次结果提示，提示显示后会自动清理。若任务仍在进行，不会显示为成功。该提示适用于常见的Bash登录环境；没有看到提示时，直接查询：
 
 ```bash
 cat /var/lib/next-vps-setup-result.tsv
 ```
 
-以下三项同时满足，才表示全部必需步骤完成：
+只有同时显示 `phase done`、`result_status complete`、`failed no` 才表示完成。NTP未同步会单独记录，不代表其他步骤失败。
 
-```text
-phase           done
-result_status   complete
-failed          no
-```
+成功后清理本次脚本、后台任务和临时日志，保留系统配置、Swap、Fail2ban数据库及结果文件。
 
-小内存机器还应显示 `swap_status verified`；大于1GiB的机器显示 `swap_status skipped`。NTP未同步属于独立警告，会如实记录。
+## 后续内核维护
 
-成功后，上传的脚本和任务日志会被清理，之后直接查看结果摘要即可。Swap文件及其启动配置、Fail2ban数据库等会保留。
+已完成本项目初始化的机器，以后使用配套工具更新内核，**无需重新运行初始化脚本**。
 
-## 出错后处理
+内核维护会自动识别版本，更新原系列官方内核，自动重启一次。核验正常后清理旧内核，只保留本次最新目标内核和原系列元包。它不执行整套系统软件升级。
 
-出现 `STOP` 或 `failed yes` 时，任务已经停止，请先保留日志并排查，不要反复运行下载命令或删除状态文件。
+**旧内核清理后没有备用内核可供回退。** 请在允许业务短暂中断时操作。
 
-修复原因后，使用原文件继续：
+下载、前置检查和开始更新：
 
 ```bash
+curl -fL --retry 3 --connect-timeout 15 \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/v1.1/next-vps-kernel-update.sh \
+  -o /root/next-vps-kernel-update.download &&
+mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
+chmod 700 /root/next-vps-kernel-update.sh &&
+bash /root/next-vps-kernel-update.sh --check &&
+bash /root/next-vps-kernel-update.sh
+```
+
+`--check` 只检查本机条件，不安装软件、不删除内核、不重启；正式运行时才获取官方更新。
+
+重启后先等待约3～10分钟，再手动连接SSH。后台任务完成或失败后同样会显示一次结果提示，也可以查询：
+
+```bash
+cat /var/lib/next-vps-kernel-update-result.tsv
+```
+
+成功标准同样是 `phase done`、`result_status complete`、`failed no`。详细步骤、jsDelivr下载方式和恢复方法见[内核维护说明](docs/kernel-update.md)。
+
+## 出错后怎么办
+
+出现 `STOP` 或 `failed yes` 时，先保留日志和任务文件，处理原因后使用**原版本、相同内容、原路径**的脚本继续：
+
+```bash
+# 初始化任务
 bash /root/next-vps-setup.sh --resume
+
+# 内核维护任务
+bash /root/next-vps-kernel-update.sh --resume
 ```
 
-恢复必须使用同一版本文件；不要在运行中换用其他版本。`cleanup_pending` 表示清理尚未完成，不等于成功。遇到清理中断且入口已删除时，按结果中的原路径上传同版本文件，再执行 `--resume`。
+只执行对应任务的命令。不要反复重新下载、删除状态文件或重跑初始化。通知提示会自行清理，失败任务所需的日志和恢复文件会保留。
 
-不要使用自己的管理IP连续试错SSH密码，以免被永久封禁。需要解封时，通过商家控制台或另一可信连接执行：
+运行日志分别位于：
 
-```bash
-fail2ban-client set sshd unbanip '被封禁的IP'
-```
+- 初始化：`/var/lib/next-vps-setup/next-vps-setup.log`
+- 内核维护：`/var/lib/next-vps-kernel-update/run.log`
 
-## 说明
+`cleanup_pending` 表示清理尚未完成，不等于成功。若脚本入口已被清理，重新上传相同内容到原路径后再执行 `--resume`。
 
-- 更新至 Debian 13 官方稳定源当前最新内核，不使用第三方内核。
-- 不建立整套本机防火墙，不启用 `nftables.service`，不清空现有规则；Fail2ban只管理自己的封禁规则。
-- 不删除旧内核、系统日志，不执行 `autoremove`。
-- 系统升级和重启有风险，请先备份重要数据，并确认能使用商家控制台。首次使用建议先在可恢复的新系统验证。
-- 固定版本链接指向1.0；后续修复通过新版本发布。
+## 其他说明
+
+- Fail2ban只管理自己的封禁规则，不启用整套本机防火墙，不清空现有规则。
+- 不做全局 `autoremove`，不清除正常系统日志。
+- 初始化结果记录当时状态；后续内核维护另存结果，不改写原初始化结果。
+- 下载链接固定为1.1，已有1.0发布保持不变。新版本不能接管其他版本尚未完成的任务。
+- 本地测试不能代替真实VPS验证，首次使用建议选择可恢复的机器。[开发验证范围](docs/kernel-update-audit.md)

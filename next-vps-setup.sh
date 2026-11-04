@@ -1,5 +1,5 @@
 #!/bin/bash
-# next-vps-setup v1.0 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v1.1 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
@@ -30,12 +30,312 @@ SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
 SWAP_BYTES=1073741824
 SWAP_RESERVE_KIB=1048576
-VERSION=1.0
+VERSION=1.1
 declare -A S=()
 IN_REBOOT=no
 
-die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+# BEGIN EMBEDDED user-interface
+# Shared terminal messages; embedded into each downloadable script.
+nv_ui_heading() {
+    local title=$1
+    printf '\n'
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then printf '\033[1;36m'; fi
+    printf '%s\n' '============================================================' "  $title" '============================================================'
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then printf '\033[0m'; fi
+}
+nv_ui_stage_name() {
+    case $1 in
+        swap) printf '准备小内存交换空间' ;;
+        update) printf '更新 Debian 官方软件包和内核' ;;
+        configure) printf '配置主机名、时区和 SSH 防护' ;;
+        kernel) printf '检查新内核启动状态' ;;
+        balloon) printf '检查气球驱动禁用状态' ;;
+        final|verify) printf '重启后核验配置和服务' ;;
+        install) printf '下载并安装官方内核' ;;
+        reboot) printf '等待重启并继续任务' ;;
+        purge) printf '核验通过，清理旧内核' ;;
+        cleanup) printf '清理本次任务文件' ;;
+        done) printf '任务已完成' ;;
+        *) printf '检查运行环境' ;;
+    esac
+}
+nv_ui_progress() {
+    nv_ui_heading "正在执行：$(nv_ui_stage_name "$1")"
+    printf '%s\n' '请等待本阶段完成；不要重复启动或替换脚本。'
+}
+nv_ui_launch() {
+    local title=$1 minutes=$2 receipt=$3 log=$4
+    nv_ui_heading "$title · 后台任务已启动"
+    printf '%s\n' \
+        '  请留意：任务会自动重启，SSH 连接会断开。' \
+        '  SSH 不会自动重连，需要使用原账号和端口手动连接。' \
+        "  首次断线后，可先等待约 $minutes 分钟再连接。" \
+        '  下载或启动较慢时会更久，请勿仅凭等待时间判断完成。' \
+        '' \
+        '  成功或失败后，下一次 root 交互式 SSH 登录会显示结果。' \
+        '  此提示显示一次后自动清理；任务仍在执行时不会报成功。' \
+        '' \
+        '  如未看到登录提示，查看任务结果：' "    cat $receipt" \
+        '  执行中的详细进度：' "    tail -f $log"
+    printf '%s\n\n' '============================================================'
+}
+nv_ui_stopped() {
+    nv_ui_heading '操作已停止 · 本次任务尚未完成'
+    printf '%s\n' '请保留下面的原因和任务日志，处理后再使用同一文件恢复。'
+    printf '原因：%s\n' "$*"
+}
+# END EMBEDDED user-interface
+
+# BEGIN EMBEDDED ssh-notice
+# BEGIN NEXT_VPS_SSH_NOTICE
+# Embedded one-time root SSH login notice. This fragment only defines functions.
+# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
+# Tests may override the two root directories and helper functions before render.
+
+nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
+nv_notice_owner() { printf '0\n'; }
+nv_notice_uuid() { [[ $1 =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
+nv_notice_id() { stat -c '%d:%i' -- "$1"; }
+nv_notice_sha() { sha256sum -- "$1" | awk '{print $1}'; }
+nv_notice_warn() { printf '\n[通知未完全清理] %s。请保留现状检查，不要递归删除系统目录。\n' "$*" >&2; }
+nv_notice_plain() {
+    local mode owner
+    owner=$(nv_notice_owner) || return 1
+    [[ -f $1 && ! -L $1 && $(stat -c %u -- "$1") == "$owner" && $(stat -c %h -- "$1") == 1 ]] || return 1
+    mode=$(stat -c %a -- "$1") || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+nv_notice_safe_dir() {
+    local path=$1 mode owner
+    owner=$(nv_notice_owner) || return 1
+    while :; do
+        [[ -d $path && ! -L $path && $(stat -c %u -- "$path") == "$owner" ]] || return 1
+        mode=$(stat -c %a -- "$path") || return 1
+        [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 )) || return 1
+        [[ $path != / ]] || break
+        path=${path%/*}; [[ -n $path ]] || path=/
+    done
+}
+nv_notice_paths() {
+    [[ $NV_NOTICE_APP == next-vps-setup || $NV_NOTICE_APP == next-vps-kernel-update ]] || return 1
+    [[ $NV_NOTICE_PROFILE_DIR =~ ^/[a-zA-Z0-9_./-]+$ && $NV_NOTICE_DATA_ROOT =~ ^/[a-zA-Z0-9_./-]+$ ]] || return 1
+    [[ $NV_NOTICE_PROFILE_DIR != *'/../'* && $NV_NOTICE_DATA_ROOT != *'/../'* && $NV_NOTICE_PROFILE_DIR != */.. && $NV_NOTICE_DATA_ROOT != */.. ]] || return 1
+    NV_NOTICE_HOOK=$NV_NOTICE_PROFILE_DIR/$NV_NOTICE_APP-notice.sh
+    NV_NOTICE_DIR=$NV_NOTICE_DATA_ROOT/$NV_NOTICE_APP-notice
+    NV_NOTICE_PENDING=$NV_NOTICE_DIR/notice.txt
+    NV_NOTICE_CLAIMED=$NV_NOTICE_DIR/consumed.txt
+    NV_NOTICE_RECEIPT=$NV_NOTICE_DATA_ROOT/$NV_NOTICE_APP-result.tsv
+}
+nv_notice_terminal() {
+    local values task phase status failed octets
+    nv_notice_plain "$NV_NOTICE_RECEIPT" && (( $(stat -c %s -- "$NV_NOTICE_RECEIPT") <= 32768 )) || return 1
+    octets=$(od -An -tx1 -- "$NV_NOTICE_RECEIPT") || return 1
+    if grep -Eq '(^|[[:space:]])00([[:space:]]|$)' <<< "$octets"; then return 1; fi
+    values=$(awk -F '\t' '
+        NF!=2 {bad=1}
+        $1=="task_id" {nt++;task=$2}
+        $1=="phase" {np++;phase=$2}
+        $1=="result_status" {ns++;status=$2}
+        $1=="failed" {nf++;failed=$2}
+        END{if(bad||nt!=1||np!=1||ns!=1||nf!=1)exit 1; printf "%s\t%s\t%s\t%s",task,phase,status,failed}' "$NV_NOTICE_RECEIPT") || return 1
+    IFS=$'\t' read -r task phase status failed <<< "$values"
+    [[ $task == "$NV_NOTICE_TASK" ]] || return 1
+    case $NV_NOTICE_KIND in
+        success) [[ $phase == done && $status == complete && $failed == no ]] ;;
+        failure) [[ $failed == yes ]] ;;
+        *) return 1 ;;
+    esac
+}
+nv_notice_validate_dir() {
+    local item
+    nv_notice_safe_dir "$NV_NOTICE_DIR" && [[ $(stat -c %a -- "$NV_NOTICE_DIR") == 700 && $(nv_notice_id "$NV_NOTICE_DIR") == "$NV_NOTICE_DIR_ID" ]] || return 1
+    for item in "$NV_NOTICE_DIR"/* "$NV_NOTICE_DIR"/.[!.]* "$NV_NOTICE_DIR"/..?*; do
+        [[ -e $item || -L $item ]] || continue
+        case $item in "$NV_NOTICE_PENDING"|"$NV_NOTICE_CLAIMED") ;; *) return 1 ;; esac
+        nv_notice_plain "$item" && [[ $(stat -c %a -- "$item") == 600 && $(nv_notice_id "$item") == "$NV_NOTICE_TEXT_ID" && $(nv_notice_sha "$item") == "$NV_NOTICE_TEXT_SHA" ]] || return 1
+    done
+    [[ ! -e $NV_NOTICE_PENDING || ! -e $NV_NOTICE_CLAIMED ]]
+}
+nv_notice_cleanup_locked() {
+    # Recheck each owned object; no glob or recursive deletion is used.
+    nv_notice_plain "$NV_NOTICE_HOOK" && [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || return 1
+    if [[ -e $NV_NOTICE_DIR || -L $NV_NOTICE_DIR ]]; then
+        nv_notice_validate_dir || return 1
+        if [[ -e $NV_NOTICE_PENDING ]]; then rm -- "$NV_NOTICE_PENDING" || return 1; fi
+        if [[ -e $NV_NOTICE_CLAIMED ]]; then rm -- "$NV_NOTICE_CLAIMED" || return 1; fi
+        rmdir -- "$NV_NOTICE_DIR" || return 1
+        sync -f "$NV_NOTICE_DATA_ROOT" || return 1
+    fi
+    nv_notice_plain "$NV_NOTICE_HOOK" && [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || return 1
+    rm -- "$NV_NOTICE_HOOK" || return 1
+    sync -f "$NV_NOTICE_PROFILE_DIR" || return 1
+}
+nv_notice_consume() (
+    # Runs as a subshell when the generated hook is sourced by /etc/profile.
+    # Non-root, non-SSH, or non-interactive shells do not read/claim the payload.
+    nv_notice_is_root || exit 0
+    [[ -n ${SSH_CONNECTION:-} && $- == *i* ]] || exit 0
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+    nv_notice_paths || exit 0
+    nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { nv_notice_warn '通知父目录身份异常'; exit 0; }
+    # Lock an existing stable directory inode: there is no lock file to leave.
+    exec 8<"$NV_NOTICE_PROFILE_DIR" || { nv_notice_warn '无法打开通知目录'; exit 0; }
+    flock -x 8 || { nv_notice_warn '无法取得通知锁'; exit 0; }
+    [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]] || exit 0
+    # A previously sourced, now superseded hook must not consume a new notice.
+    [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || exit 0
+    nv_notice_plain "$NV_NOTICE_HOOK" || { nv_notice_warn '通知入口身份异常'; exit 0; }
+    # A success hook can be staged before cleanup deletes its worker. Until the
+    # durable receipt is final, logging in must not consume or display it.
+    nv_notice_terminal || exit 0
+    if [[ -e $NV_NOTICE_DIR || -L $NV_NOTICE_DIR ]]; then
+        nv_notice_validate_dir || { nv_notice_warn '通知内容或目录已变化，已拒绝显示和删除'; exit 0; }
+        if [[ -e $NV_NOTICE_PENDING ]]; then
+            # Rename claims delivery under the lock. Later logins only retry
+            # cleanup if a previous display/cleanup was interrupted.
+            mv -T -- "$NV_NOTICE_PENDING" "$NV_NOTICE_CLAIMED" || { nv_notice_warn '无法标记本次通知'; exit 0; }
+            sync -f "$NV_NOTICE_DIR" || { nv_notice_warn '通知标记未能持久保存'; exit 0; }
+            cat -- "$NV_NOTICE_CLAIMED" || { nv_notice_warn '通知输出未完成'; exit 0; }
+        fi
+    fi
+    nv_notice_cleanup_locked || nv_notice_warn "通知文件尚未清理完成：$NV_NOTICE_HOOK"
+    exit 0
+)
+nv_notice_render_hook() {
+    printf '# next-vps-ssh-notice 1\n'
+    printf '# app\t%s\n# task\t%s\n# generation\t%s\n# directory_id\t%s\n# text_id\t%s\n# text_sha\t%s\n# hook_id\t%s\n# kind\t%s\n' \
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND"
+    # /etc/profile.d is shared with POSIX login shells. This complete POSIX
+    # command returns before a non-Bash shell reads any Bash-specific grammar.
+    printf '[ -n "${BASH_VERSION:-}" ] || return 0\n'
+    printf '(\n'
+    printf 'NV_NOTICE_APP=%q\nNV_NOTICE_TASK=%q\nNV_NOTICE_GENERATION=%q\nNV_NOTICE_DIR_ID=%q\nNV_NOTICE_TEXT_ID=%q\nNV_NOTICE_TEXT_SHA=%q\nNV_NOTICE_HOOK_ID=%q\nNV_NOTICE_KIND=%q\nNV_NOTICE_PROFILE_DIR=%q\nNV_NOTICE_DATA_ROOT=%q\n' \
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" "$NV_NOTICE_PROFILE_DIR" "$NV_NOTICE_DATA_ROOT"
+    declare -f nv_notice_is_root nv_notice_owner nv_notice_id nv_notice_sha nv_notice_warn nv_notice_plain nv_notice_safe_dir nv_notice_paths nv_notice_terminal nv_notice_validate_dir nv_notice_cleanup_locked nv_notice_consume
+    printf 'nv_notice_consume\n)\n'
+}
+nv_notice_load_existing() {
+    local first key value extra expected line n=0
+    nv_notice_plain "$NV_NOTICE_HOOK" || return 1
+    IFS= read -r first < "$NV_NOTICE_HOOK"
+    [[ $first == '# next-vps-ssh-notice 1' ]] || return 1
+    while IFS=$'\t' read -r key value extra; do
+        n=$((n+1)); [[ $n != 1 ]] || continue
+        ((n<=9)) || break
+        [[ -z $extra && -n $value ]] || return 1
+        case $n:$key in
+            '2:# app') [[ $value == "$NV_NOTICE_APP" ]] || return 1 ;;
+            '3:# task') nv_notice_uuid "$value" || return 1; NV_NOTICE_TASK=$value ;;
+            '4:# generation') nv_notice_uuid "$value" || return 1; NV_NOTICE_GENERATION=$value ;;
+            '5:# directory_id') [[ $value =~ ^[0-9]+:[0-9]+$ ]] || return 1; NV_NOTICE_DIR_ID=$value ;;
+            '6:# text_id') [[ $value =~ ^[0-9]+:[0-9]+$ ]] || return 1; NV_NOTICE_TEXT_ID=$value ;;
+            '7:# text_sha') [[ $value =~ ^[a-f0-9]{64}$ ]] || return 1; NV_NOTICE_TEXT_SHA=$value ;;
+            '8:# hook_id') [[ $value =~ ^[0-9]+:[0-9]+$ ]] || return 1; NV_NOTICE_HOOK_ID=$value ;;
+            '9:# kind') [[ $value == success || $value == failure ]] || return 1; NV_NOTICE_KIND=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$NV_NOTICE_HOOK"
+    ((n>=9)) && [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || return 1
+    # Compare static source as data; do not source an earlier hook to inspect it.
+    cmp -s "$NV_NOTICE_HOOK" <(nv_notice_render_hook) || return 1
+    [[ ! -e $NV_NOTICE_DIR && ! -L $NV_NOTICE_DIR ]] || nv_notice_validate_dir
+}
+nv_notice_stage_name() {
+    case $1 in
+        swap) printf '准备交换空间' ;; update) printf '更新官方软件包' ;;
+        configure) printf '配置系统基础设置' ;; kernel|install) printf '安装官方内核' ;;
+        balloon) printf '核验气球驱动保护' ;; reboot) printf '重启并等待启动' ;;
+        verify|final) printf '核验重启后的系统状态' ;; purge) printf '清理旧内核' ;;
+        cleanup) printf '清理本次任务文件' ;; done) printf '完成核验' ;;
+        *) printf '任务执行（%s）' "$1" ;;
+    esac
+}
+nv_notice_text() {
+    local kind=$1 stage=$2 ntp=$3 entry=$4 result log title
+    result=/var/lib/$NV_NOTICE_APP-result.tsv
+    if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
+    else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
+    printf '\n╭──────────────────────────────────────────────╮\n'
+    if [[ $kind == success ]]; then
+        printf '  ✓ %s已完成\n' "$title"
+        printf '  状态：成功；必需步骤和最终核查已通过，可继续使用服务器。\n'
+    else
+        printf '  ✗ %s已停止\n' "$title"
+        printf '  状态：失败，任务未完成，请先查看原因。\n  出错阶段：%s\n' "$(nv_notice_stage_name "$stage")"
+    fi
+    if [[ $ntp == unsynchronized || $ntp == unavailable ]]; then
+        printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n'
+    fi
+    if [[ $kind == success ]]; then
+        printf '  如需查看详细记录：\n    cat %s\n' "$result"
+    else
+        printf '  下一步：查看失败详情。\n    journalctl -u %s.service -n 80 --no-pager\n' "$NV_NOTICE_APP"
+        printf '  文件日志：%s\n' "$log"
+        printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
+        printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
+    fi
+    printf '  此为一次性通知；读取后自动清理通知文件。\n╰──────────────────────────────────────────────╯\n\n'
+}
+nv_notice_install() (
+    set -Eeuo pipefail
+    export LC_ALL=C
+    umask 077
+    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
+    local temp_dir= temp_hook= published_dir=no published_hook=no code
+    (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
+    NV_NOTICE_APP=$1
+    NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
+    NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
+    nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
+    [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
+    [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
+    [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
+    nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
+    exec 8<"$NV_NOTICE_PROFILE_DIR" || exit 1
+    flock -x 8 || exit 1
+    if [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]]; then
+        nv_notice_load_existing && nv_notice_cleanup_locked || { printf 'NOTICE_ERROR: existing notice identity differs; not overwritten\n' >&2; exit 1; }
+    fi
+    [[ ! -e $NV_NOTICE_DIR && ! -L $NV_NOTICE_DIR ]] || { printf 'NOTICE_ERROR: unknown notice directory; not adopted\n' >&2; exit 1; }
+    # Delete only known temporary objects on ordinary install errors. A power
+    # interruption can require inspection; no unrelated path is ever adopted.
+    trap 'code=$?; if [[ -n $temp_hook && -f $temp_hook && ! -L $temp_hook ]]; then rm -- "$temp_hook" || true; fi; if [[ -n $temp_dir && -d $temp_dir && ! -L $temp_dir ]]; then [[ ! -f $temp_dir/notice.txt ]] || rm -- "$temp_dir/notice.txt" || true; rmdir -- "$temp_dir" || true; fi; if [[ $published_dir == yes && $published_hook == no ]] && nv_notice_validate_dir; then [[ ! -f $NV_NOTICE_PENDING ]] || rm -- "$NV_NOTICE_PENDING" || true; rmdir -- "$NV_NOTICE_DIR" || true; fi; exit "$code"' EXIT
+    # Explicit checks are intentional: the failure trap may invoke this function
+    # in an `if`/`||` context, where Bash suppresses errexit inside functions.
+    temp_dir=$(mktemp -d "$NV_NOTICE_DATA_ROOT/.$NV_NOTICE_APP-notice.XXXXXX") || exit 1
+    [[ $temp_dir == "$NV_NOTICE_DATA_ROOT/.$NV_NOTICE_APP-notice."* && -d $temp_dir && ! -L $temp_dir ]] || exit 1
+    temp_hook=$(mktemp "$NV_NOTICE_PROFILE_DIR/.$NV_NOTICE_APP-notice.XXXXXX") || exit 1
+    [[ $temp_hook == "$NV_NOTICE_PROFILE_DIR/.$NV_NOTICE_APP-notice."* && -f $temp_hook && ! -L $temp_hook ]] || exit 1
+    NV_NOTICE_TASK=$task; NV_NOTICE_KIND=$kind
+    NV_NOTICE_GENERATION=$(cat /proc/sys/kernel/random/uuid) || exit 1
+    nv_notice_uuid "$NV_NOTICE_GENERATION" || exit 1
+    NV_NOTICE_DIR_ID=$(nv_notice_id "$temp_dir") || exit 1
+    nv_notice_text "$kind" "$stage" "$ntp" "$entry" > "$temp_dir/notice.txt" || exit 1
+    chmod 0600 "$temp_dir/notice.txt" || exit 1
+    NV_NOTICE_TEXT_ID=$(nv_notice_id "$temp_dir/notice.txt") || exit 1
+    NV_NOTICE_TEXT_SHA=$(nv_notice_sha "$temp_dir/notice.txt") || exit 1
+    NV_NOTICE_HOOK_ID=$(nv_notice_id "$temp_hook") || exit 1
+    nv_notice_render_hook > "$temp_hook" || exit 1
+    chmod 0644 "$temp_hook" || exit 1
+    sync -f "$temp_dir/notice.txt" && sync -f "$temp_hook" || exit 1
+    mv -T -- "$temp_dir" "$NV_NOTICE_DIR" || exit 1
+    temp_dir=; published_dir=yes
+    sync -f "$NV_NOTICE_DATA_ROOT" || exit 1
+    mv -T -- "$temp_hook" "$NV_NOTICE_HOOK" || exit 1
+    temp_hook=; published_hook=yes
+    sync -f "$NV_NOTICE_PROFILE_DIR" || exit 1
+    trap - EXIT
+)
+# END NEXT_VPS_SSH_NOTICE
+# END EMBEDDED ssh-notice
+
+die() { nv_ui_stopped "$*" >&2; exit 1; }
 note() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+publish_login_notice() {
+    local kind=$1 ntp=${S[ntp_status]:-not-recorded}
+    case $ntp in synchronized|unsynchronized|unavailable) ;; *) ntp=not-recorded ;; esac
+    nv_notice_install next-vps-setup "$kind" "${S[task_id]}" "${S[phase]}" "$ntp" "${S[entry_path]}"
+}
 validate_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
 validate_boot_id() { [[ $1 =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
 validate_hostname() {
@@ -77,7 +377,7 @@ plain_root_file() {
 }
 safe_entry_path() {
     local path=$1 parent
-    [[ $path == /root/* && $path != *[[:cntrl:]]* ]] || return 1
+    [[ $path == /root/*.sh && $path =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ ]] || return 1
     plain_root_file "$path" || return 1
     [[ $(readlink -e -- "$path") == "$path" ]] || return 1
     parent=${path%/*}
@@ -251,7 +551,7 @@ check_resources() {
 check_os() {
     [[ $(id -u) == 0 ]] || die 'Use a root login, or sudo -i, then run the local /root copy.'
     local command
-    for command in apt-get apt-cache apt-config apt-mark awk blkid cat chmod chown cmp cp cut date dd df dpkg dpkg-query findmnt flock getconf getent grep hostnamectl id install ln mkdir mktemp mkswap modprobe mv od readlink rm rmdir sed sha256sum sleep sort ss stat swapon sync sysctl systemctl systemd-detect-virt timedatectl uname update-initramfs; do
+    for command in apt-get apt-cache awk blkid cat chmod chown cmp cp cut date dd df dpkg dpkg-query env find findmnt flock getconf getent grep hostnamectl id install ln mkdir mktemp mkswap modprobe mv od readlink rm rmdir sed sha256sum sleep sort ss stat swapon sync sysctl systemctl systemd-detect-virt timedatectl uname update-initramfs; do
         command -v "$command" >/dev/null || die "Missing prerequisite: $command"
     done
     [[ -f /etc/debian_version && -d /run/systemd/system ]] || die 'Debian with systemd is required.'
@@ -265,62 +565,214 @@ check_os() {
     local audit
     audit=$(dpkg --audit)
     [[ -z $audit ]] || die 'dpkg has incomplete packages; repair them before retrying.'
-    [[ -z $(apt-mark showhold) ]] || die 'Held packages exist; no holds were changed.'
+    local selections
+    selections=$(dpkg --get-selections)
+    if awk '$2=="hold"{found=1} END{exit !found}' <<< "$selections"; then die '发现锁定的软件包。请先确认锁定原因，本次没有解除限制。'; fi
 
 }
-validate_index_uri() {
-    local uri=$1 base suite file line
-    [[ $uri == */dists/* ]] || return 1
-    base=${uri%%/dists/*}; suite=${uri#*/dists/}; suite=${suite%%/*}
-    [[ $suite == trixie || $suite == trixie-updates || $suite == trixie-security ]] || return 1
-    case $base in
-        http://deb.debian.org/debian|https://deb.debian.org/debian|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|http://security.debian.org/debian-security|https://security.debian.org/debian-security) ;;
-        mirror+file:/etc/apt/mirrors/debian.list|mirror+file:/etc/apt/mirrors/debian-security.list|mirror+file:///etc/apt/mirrors/debian.list|mirror+file:///etc/apt/mirrors/debian-security.list)
-            file=${base#mirror+file:}; while [[ $file == //* ]]; do file=${file#/}; done
-            plain_root_file "$file" || return 1
-            local seen=no
-            while IFS= read -r line || [[ -n $line ]]; do
-                [[ -z $line || $line == \#* ]] && continue
-                case $line in http://deb.debian.org/debian|https://deb.debian.org/debian|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|http://security.debian.org/debian-security|https://security.debian.org/debian-security) seen=yes ;; *) return 1 ;; esac
-            done < "$file"
-            [[ $seen == yes ]] || return 1 ;;
-        *) return 1 ;;
-    esac
-    printf '%s\n' "$suite"
+# BEGIN NEXT-VPS OFFICIAL APT VIEW
+# This block is embedded unchanged in both standalone delivery scripts.
+official_apt_root() { printf '%s-apt\n' "$BASE"; }
+official_apt_file_ok() {
+    local mode
+    [[ -f $1 && ! -L $1 && $(stat -c %u -- "$1") == 0 && $(stat -c %h -- "$1") == 1 ]] || return 1
+    mode=$(stat -c %a -- "$1") || return 1
+    (( (8#$mode & 022) == 0 ))
+}
+official_apt_dir_ok() {
+    local mode uid apt_uid
+    [[ -d $1 && ! -L $1 ]] || return 1
+    mode=$(stat -c %a -- "$1"); uid=$(stat -c %u -- "$1") || return 1
+    apt_uid=$(id -u _apt) || return 1
+    [[ $uid == 0 || ( ${2:-root} == download && $uid == "$apt_uid" ) ]] || return 1
+    if [[ ${2:-root} == download ]]; then [[ $mode == 755 || $mode == 700 ]]; else [[ $mode == 755 ]]; fi
 }
 check_sources() {
-    local output line uri suite main=no security=no
-    output=$(apt-get --print-uris update) || die 'Cannot inspect configured APT source URIs.'
-    while IFS= read -r line; do
-        [[ ${line:0:1} == "'" ]] || continue
-        uri=${line#\'}; uri=${uri%%\'*}
-        suite=$(validate_index_uri "$uri") || die "Unsupported repository URI: $uri"
-        [[ $suite != trixie ]] || main=yes
-        [[ $suite != trixie-security ]] || security=yes
-    done <<< "$output"
-    [[ $main == yes && $security == yes ]] || die 'Both official trixie and trixie-security sources are required.'
-    local unsafe
-    unsafe=$(apt-config dump | grep -Ei '(AllowUnauthenticated|AllowInsecureRepositories|AllowDowngradeToInsecureRepositories).*"(true|1)"' || true)
-    [[ -z $unsafe ]] || die 'Insecure APT options are enabled; they were not changed.'
-    if grep -Eiq '(^|[[:space:]])(trusted|allow-insecure)[[:space:]]*=[[:space:]]*(yes|true)|^[[:space:]]*(Trusted|Allow-Insecure):[[:space:]]*(yes|true)' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null; then
-        die 'APT source bypasses trust verification; no source files were changed.'
+    # Host source files, pins and APT hooks are neither loaded nor changed.
+    official_apt_file_ok /usr/share/keyrings/debian-archive-keyring.gpg &&
+        [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]] || die '缺少可读取的 Debian 官方签名密钥文件，请先检查系统完整性。'
+    (( (8#$(stat -c %a -- /usr/share/keyrings/debian-archive-keyring.gpg) & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
+    id -u _apt >/dev/null 2>&1 || die '系统缺少 APT 下载沙箱用户，请先修复基础软件包。'
+    [[ $BASE =~ ^/[a-zA-Z0-9_./-]+$ ]] || die 'Unsafe private APT path.'
+}
+official_apt_sources_content() {
+    cat <<'OFFICIAL_SOURCES'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: trixie-security
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+OFFICIAL_SOURCES
+}
+official_apt_config_content() {
+    local root; root=$(official_apt_root)
+    cat <<OFFICIAL_CONFIG
+Dir "/";
+Dir::Etc "$root";
+Dir::Etc::main "$root/empty.conf";
+Dir::Etc::parts "$root/parts";
+Dir::Etc::sourcelist "$root/official.sources";
+Dir::Etc::sourceparts "$root/sourceparts";
+Dir::Etc::preferences "$root/preferences";
+Dir::Etc::preferencesparts "$root/preferencesparts";
+Dir::Etc::trusted "/usr/share/keyrings/debian-archive-keyring.gpg";
+Dir::Etc::trustedparts "$root/trustedparts";
+Dir::Etc::netrc "$root/auth.conf";
+Dir::Etc::netrcparts "$root/authparts";
+Dir::State "/var/lib/apt";
+Dir::State::status "/var/lib/dpkg/status";
+Dir::State::extended_states "/var/lib/apt/extended_states";
+Dir::State::lists "$root/lists";
+Dir::Cache "/var/cache/apt";
+Dir::Cache::archives "/var/cache/apt/archives";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+Dir::Log "/var/log/apt";
+Dir::Bin::dpkg "/usr/bin/dpkg";
+APT::Architecture "amd64";
+APT::Architectures { "amd64"; };
+APT::Sandbox::User "_apt";
+APT::Get::AutomaticRemove "false";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APT::Protect-Kernels "true";
+APT::NeverAutoRemove::KernelCount "2";
+APT::Get::AllowUnauthenticated "false";
+APT::Get::allow-downgrades "false";
+APT::Get::allow-change-held-packages "false";
+Acquire::AllowInsecureRepositories "false";
+Acquire::AllowDowngradeToInsecureRepositories "false";
+Acquire::Check-Valid-Until "true";
+Acquire::Languages "none";
+Acquire::PDiffs "false";
+Acquire::Retries "2";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+DPkg::Lock::Timeout "300";
+DPkg::Options { "--force-confold"; };
+OFFICIAL_CONFIG
+}
+official_apt_publish() {
+    local path=$1 content=$2 tmp
+    if [[ -e $path || -L $path ]]; then
+        official_apt_file_ok "$path" && cmp -s "$path" <(printf '%s' "$content") || die '本次更新使用的官方源配置已被改动，已停止以避免使用未知配置。'
+        return
     fi
+    tmp=$(mktemp "${path%/*}/.official-apt.XXXXXX") || return 1
+    if ! printf '%s' "$content" > "$tmp" || ! chmod 0644 "$tmp" || ! sync -f "$tmp"; then
+        rm -- "$tmp" || true; return 1
+    fi
+    if ! mv -T -- "$tmp" "$path"; then rm -- "$tmp" || true; return 1; fi
+    sync -f "${path%/*}"
+}
+official_apt_check_tree() {
+    local root path relative uid apt_uid listing
+    root=$(official_apt_root)
+    official_apt_dir_ok "$root" || return 1
+    apt_uid=$(id -u _apt) || return 1
+    listing=$(find -P "$root" -xdev -mindepth 1 -print) || return 1
+    while IFS= read -r path; do
+        [[ -n $path ]] || continue
+        relative=${path#"$root"/}
+        case $relative in
+            owner|apt.conf|empty.conf|official.sources|preferences|auth.conf)
+                official_apt_file_ok "$path" || return 1 ;;
+            parts|sourceparts|preferencesparts|trustedparts|authparts|lists)
+                official_apt_dir_ok "$path" || return 1 ;;
+            lists/partial|lists/auxfiles)
+                official_apt_dir_ok "$path" download || return 1 ;;
+            lists/*)
+                [[ $relative =~ ^lists/(partial/|auxfiles/)?(lock|deb\.debian\.org_debian_dists_trixie[-a-zA-Z0-9_.%+~]*|security\.debian\.org_debian-security_dists_trixie-security[-a-zA-Z0-9_.%+~]*)$ ]] || return 1
+                [[ -f $path && ! -L $path && $(stat -c %h -- "$path") == 1 ]] || return 1
+                uid=$(stat -c %u -- "$path") || return 1
+                [[ $uid == 0 || $uid == "$apt_uid" ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+    done <<< "$listing"
+}
+official_apt_prepare() {
+    local root directory content
+    check_sources
+    root=$(official_apt_root)
+    official_apt_dir_ok "${root%/*}" || die 'Unsafe private APT parent directory.'
+    [[ -n ${S[task_id]:-} && ${S[task_id]} =~ ^[a-f0-9-]{36}$ ]] || die 'A task identity is required for private APT.'
+    if [[ ! -e $root && ! -L $root ]]; then mkdir -m 0755 -- "$root"; fi
+    official_apt_dir_ok "$root" || die '更新暂存目录的权限或类型不安全，已停止。'
+    if [[ ! -e $root/owner && ! -L $root/owner ]]; then
+        [[ -z $(find -P "$root" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'Unowned private APT data exists.'
+    fi
+    official_apt_publish "$root/owner" "${S[task_id]}"$'\n'
+    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial; do
+        if [[ ! -e $root/$directory && ! -L $root/$directory ]]; then mkdir -m 0755 -- "$root/$directory"; fi
+        case $directory in lists/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
+    done
+    official_apt_publish "$root/empty.conf" ''
+    official_apt_publish "$root/preferences" ''
+    official_apt_publish "$root/auth.conf" ''
+    content=$(official_apt_sources_content); official_apt_publish "$root/official.sources" "$content"$'\n'
+    content=$(official_apt_config_content); official_apt_publish "$root/apt.conf" "$content"$'\n'
+    official_apt_check_tree || die '更新暂存目录出现未知内容或权限变化，已停止，请保留现场检查。'
+}
+official_apt_exec() {
+    local tool=$1 root; shift
+    root=$(official_apt_root)
+    env -u APT_CONFIG -u DPKG_ROOT -u DPKG_ADMINDIR -u DPKG_FORCE -u DPKG_FRONTEND_LOCKED \
+        -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        APT_CONFIG="$root/apt.conf" DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_MODE=l \
+        "$tool" "$@"
+}
+apt_run() { official_apt_prepare; official_apt_exec apt-get "$@"; }
+apt_cache() { official_apt_prepare; official_apt_exec apt-cache "$@"; }
+official_apt_ready() {
+    local root prefix file found
+    root=$(official_apt_root)
+    for prefix in deb.debian.org_debian_dists_trixie security.debian.org_debian-security_dists_trixie-security; do
+        [[ -s $root/lists/${prefix}_InRelease ]] || return 1
+        found=no
+        for file in "$root/lists/${prefix}_main_binary-amd64_Packages" "$root/lists/${prefix}_main_binary-amd64_Packages."*; do
+            [[ ! -s $file ]] || found=yes
+        done
+        [[ $found == yes ]] || return 1
+    done
 }
 check_origins() {
-    local output
-    output=$(apt-cache policy)
+    local output; output=$(apt_cache policy)
     awk '/^[[:space:]]*release / {
         if($0~/a=now([,[:space:]]|$)/)next
-        if($0!~/o=Debian(-Security)?([,[:space:]]|$)/ || $0!~/n=trixie(-updates|-security)?([,[:space:]]|$)/) bad=1
+        if($0!~/o=Debian(-Security)?([,[:space:]]|$)/ || $0!~/n=trixie(-updates|-security)?([,[:space:]]|$)/)bad=1
         n++
-    } END{exit(bad || n==0)}' <<< "$output" || die 'APT package indexes include unsupported origins or suites.'
+    } END{exit(bad||n==0)}' <<< "$output" || die '软件索引未通过 Debian 13 官方来源检查，已停止。'
 }
-apt_run() {
-    DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_MODE=l \
-    apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-        -o Dpkg::Options::=--force-confold "$@"
+strict_update() { official_apt_prepare; apt_run --error-on=any update; check_origins; }
+official_apt_recover_indexes() {
+    official_apt_prepare
+    if ! official_apt_ready; then strict_update; fi
 }
-strict_update() { check_sources; apt_run --error-on=any update; check_origins; }
+official_apt_cleanup() {
+    local root path
+    root=$(official_apt_root)
+    [[ -e $root || -L $root ]] || return 0
+    official_apt_file_ok "$root/owner" && [[ $(cat "$root/owner") == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
+    official_apt_check_tree || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+    # Delete only the previously checked regular files; never recurse with rm.
+    while IFS= read -r -d '' path; do rm -- "$path" || return 1; done < <(find -P "$root" -xdev -type f ! -name owner -print0)
+    for path in lists/partial lists/auxfiles lists parts sourceparts preferencesparts trustedparts authparts; do
+        [[ ! -d $root/$path ]] || rmdir -- "$root/$path" || return 1
+    done
+    rm -- "$root/owner" || return 1
+    rmdir -- "$root" || return 1
+    sync -f "${root%/*}"
+}
+# END NEXT-VPS OFFICIAL APT VIEW
+
 apt_install() { apt_run install -y --no-remove --no-install-recommends "$@"; }
 candidate_has_index() {
     local version=$1
@@ -333,7 +785,7 @@ candidate_has_index() {
 check_candidate() {
     local pkg=$1 output installed_version candidate
     installed "$pkg" || die "Package is not fully installed: $pkg"
-    output=$(apt-cache policy "$pkg")
+    output=$(apt_cache policy "$pkg")
     installed_version=$(awk '$1=="Installed:"{print $2}' <<< "$output")
     candidate=$(awk '$1=="Candidate:"{print $2}' <<< "$output")
     [[ -n $candidate && $candidate != '(none)' && $installed_version == "$candidate" ]] || die "Installed/Candidate mismatch: $pkg"
@@ -379,11 +831,11 @@ swap_owner_content() {
     printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "$SWAP_BYTES"
 }
 swap_unit_content() {
-    printf '%s\n' '# Managed by next-vps-setup v1.0' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
+    printf '%s\n' '# Managed by next-vps-setup v1.1' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
         '' '[Swap]' "What=$SWAP_FILE" 'Priority=10' 'TimeoutSec=90s' \
         '' '[Install]' 'WantedBy=swap.target'
 }
-swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.0' 'vm.swappiness = 10'; }
+swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.1' 'vm.swappiness = 10'; }
 swap_mount_field() {
     local value
     value=$(findmnt --raw --noheadings --first-only --output "$1" --target /var/lib) || die 'Cannot inspect the Swap filesystem.'
@@ -491,7 +943,7 @@ phase_swap() {
     local active=no free allocated
     if [[ ${S[swap_policy]} == skip ]]; then
         S[swap_status]=skipped; S[phase]=update; save_state
-        note 'MemTotal exceeds 1 GiB: disk Swap and memory settings were left unchanged.'
+        note '实际内存大于 1GiB：不新建 Swap，保留已有内存设置。'
         return 0
     fi
     if [[ ${S[swap_status]} == pending ]]; then
@@ -530,7 +982,7 @@ phase_swap() {
     S[swap_status]=active; dirty
     verify_swap
     S[phase]=update; save_state
-    note 'Prepared owned 1 GiB disk Swap, priority 10 and swappiness 10; boot persistence will be verified before success.'
+    note '已启用 1GiB Swap，优先级 10、swappiness=10；稍后会重启检查是否持久生效。'
 }
 phase_update() {
     check_resources; strict_update
@@ -556,7 +1008,7 @@ publish_config() {
 }
 jail_content() {
     cat <<'JAIL_HEADER'
-# Managed by next-vps-setup v1.0
+# Managed by next-vps-setup v1.1
 [sshd]
 enabled = true
 JAIL_HEADER
@@ -571,7 +1023,7 @@ bantime = -1
 action = nftables[type=multiport, name=sshd, port="%(port)s", protocol=tcp, table=f2b-next-vps-setup]
 JAIL_BODY
 }
-balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.0' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
+balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.1' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
 configure_hostname() {
     if [[ $(hostnamectl --static) != "${S[hostname]}" ]]; then hostnamectl set-hostname "${S[hostname]}"; dirty; fi
     if ! getent hosts "${S[hostname]}" >/dev/null; then
@@ -601,7 +1053,7 @@ ntp_observe() {
 }
 ntp_warning() {
     if [[ ${S[ntp_status]} != synchronized ]]; then
-        note "WARNING: NTP ${S[ntp_status]}; keeping the existing system clock and continuing. No successful synchronization is claimed."
+        note '提醒：尚未完成网络校时，继续使用系统当前时间；其他步骤会继续执行。'
     fi
     return 0
 }
@@ -625,11 +1077,11 @@ configure_ntp() {
     fi
     if [[ ${S[ntp_unit]} == systemd-timesyncd.service ]]; then
         if ! systemctl restart systemd-timedated.service; then
-            note 'WARNING: Could not restart systemd-timedated; time synchronization is optional.'
+            note '提醒：时间管理服务暂时无法重启，校时不作为必需完成条件。'
         fi
     fi
     if ! systemctl enable --now "${S[ntp_unit]}"; then
-        note "WARNING: Could not enable/start ${S[ntp_unit]}; time synchronization is optional."
+        note "提醒：无法启动校时服务 ${S[ntp_unit]}，其他步骤会继续执行。"
     fi
     dirty
     if [[ $first_attempt == yes ]]; then wait_ntp; else ntp_observe; ntp_warning; fi
@@ -688,7 +1140,8 @@ request_reboot() {
     [[ ${S[reboot_wait]} == none && ${S[reboot_count]} -lt 3 ]] || die 'Reboot limit or pending reboot prevents another request.'
     S[boot_before]=$(boot_id); S[reboot_count]=$((S[reboot_count]+1)); S[reboot_wait]=$reason
     save_state; sync
-    note "Saved stage ${S[phase]}; requesting normal reboot ($reason), count ${S[reboot_count]}/3."
+    nv_ui_heading "即将自动重启 · 第 ${S[reboot_count]} 次"
+    note "当前阶段：$(nv_ui_stage_name "${S[phase]}")。重启后会自动继续；SSH 需要手动重连。"
     IN_REBOOT=yes
     systemctl reboot --no-block
     exit 0
@@ -735,6 +1188,7 @@ phase_balloon() {
     S[phase]=final; save_state
 }
 verify_all() {
+    official_apt_recover_indexes
     [[ $(uname -r) == "${S[target_kernel]}" ]] || die 'Running kernel differs from target.'
     check_candidate "${S[kernel_meta]}"; check_candidate "linux-image-${S[target_kernel]}"
     check_ssh "${S[ssh_port]}"
@@ -785,7 +1239,7 @@ cleanup_success() {
     verify_all; verify_task_files
     [[ ${S[result_status]} == cleanup_pending ]] || die 'Cleanup lacks a verified receipt.'
     write_state_to "$RESULT"
-    apt-get clean
+    apt_run clean
     if [[ -e $UNIT_FILE || -L $UNIT_FILE ]]; then
         plain_root_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die 'Temporary unit was changed; it was not removed.'
         systemctl disable "$UNIT"
@@ -797,6 +1251,10 @@ cleanup_success() {
     if [[ -e $entry || -L $entry ]]; then
         safe_entry_path "$entry" && [[ $(file_identity "$entry") == "${S[entry_identity]}" && $(file_sha "$entry") == "${S[entry_sha]}" ]] || die 'Entry file was replaced; automatic deletion refused.'
     fi
+    # Stage the notice while recovery files still exist. The login hook waits
+    # for this same task's durable done/complete receipt before displaying it.
+    publish_login_notice success
+    official_apt_cleanup
     # Receipt is already durable: recovery after this point is cleanup-only.
     rm -- "$STATE_FILE" "$BASE/owner" "$WORKER"
     [[ ! -e $BASE/next-vps-setup.log ]] || rm -- "$BASE/next-vps-setup.log"
@@ -805,7 +1263,8 @@ cleanup_success() {
     [[ ! -e $entry && ! -L $entry && ! -e $BASE && ! -e $UNIT_FILE ]] || die 'Cleanup incomplete; retained receipt allows cleanup recovery.'
     S[phase]='done'; S[result_status]=complete; S[failed]=no
     write_state_to "$RESULT"
-    note "COMPLETE: kernel ${S[target_kernel]}, SSH ${S[ssh_port]}, Asia/Kuala_Lumpur, Fail2ban 5/600/-1, Swap ${S[swap_status]}, NTP ${S[ntp_status]:-not-recorded}. Receipt: $RESULT"
+    nv_ui_heading '初始化已完成 · 重启核验通过'
+    note "当前内核：${S[target_kernel]}；SSH 端口：${S[ssh_port]}；结果：$RESULT"
 }
 unit_content() {
     cat <<'UNIT_CONTENT'
@@ -834,8 +1293,16 @@ on_worker_error() {
     trap - ERR EXIT TERM HUP INT
     if [[ ${IN_REBOOT:-no} == yes && $code == 143 ]]; then exit 0; fi
     [[ $code != 0 ]] || code=1
-    printf 'FAILED: stage=%s; no success declared. Inspect %s/next-vps-setup.log and journalctl -u %s.\n' "${S[phase]:-unknown}" "$BASE" "$UNIT" >&2
-    if [[ -d $BASE && -n ${S[phase]:-} ]]; then S[failed]=yes; save_state || true; fi
+    nv_ui_heading '初始化未完成 · 已停止自动执行' >&2
+    printf '出错阶段：%s\n查看原因：tail -n 100 %s/next-vps-setup.log\n修复后恢复：bash %s --resume\n' "$(nv_ui_stage_name "${S[phase]:-unknown}")" "$BASE" "${S[entry_path]:-/root/next-vps-setup.sh}" >&2
+    if [[ -n ${S[phase]:-} ]]; then
+        if [[ ${S[result_status]:-} == complete ]]; then S[phase]=cleanup; S[result_status]=cleanup_pending; fi
+        S[failed]=yes
+        if [[ -d $BASE ]]; then save_state || true; fi
+        if write_state_to "$RESULT"; then
+            publish_login_notice failure || printf '%s\n' '提醒：首次登录通知未能保存，请使用结果查询命令查看失败状态。' >&2
+        fi
+    fi
     exit "$code"
 }
 worker_main() {
@@ -852,7 +1319,7 @@ worker_main() {
     check_os; verify_task_files
     consume_reboot
     while :; do
-        note "Stage ${S[phase]}; boot $(boot_id)."
+        nv_ui_progress "${S[phase]}"
         case ${S[phase]} in
             swap) phase_swap ;; update) phase_update ;; configure) phase_configure ;; kernel) phase_kernel ;;
             balloon) phase_balloon ;; final) phase_final ;;
@@ -862,24 +1329,36 @@ worker_main() {
     done
 }
 print_status() {
-    printf 'Phase: %s\nResult: %s\nFailed: %s\nHost: %s\nSSH port: %s\nTarget kernel: %s\nReboots: %s/3\nSwap: %s (%s)\n' "${S[phase]}" "${S[result_status]}" "${S[failed]}" "${S[hostname]}" "${S[ssh_port]}" "${S[target_kernel]}" "${S[reboot_count]}" "${S[swap_status]}" "${S[swap_policy]}"
-    printf 'NTP status: %s\n' "${S[ntp_status]:-not-recorded}"
+    nv_ui_heading "next-vps-setup $VERSION · 初始化状态"
+    printf '当前阶段：%s\n机器名：%s\nSSH 端口：%s\n目标内核：%s\n已请求重启：%s 次\n' "$(nv_ui_stage_name "${S[phase]}")" "${S[hostname]}" "${S[ssh_port]}" "${S[target_kernel]}" "${S[reboot_count]}"
     if [[ ${S[failed]} == yes ]]; then
-        printf '%s\n' '任务已失败停止；Result: running 仅表示尚未完成，不代表后台仍在执行。'
-    elif [[ ${S[ntp_status]:-not-recorded} == unsynchronized || ${S[ntp_status]:-not-recorded} == unavailable ]]; then
-        printf '%s\n' '警告：NTP 未通过同步检查，沿用系统当前时间；这不会阻止其他步骤完成。'
+        printf '%s\n' '结果：未完成，任务已停止。请先查看日志，再使用同一版本恢复。'
+        printf '  tail -n 100 %s/next-vps-setup.log\n' "$BASE"
+    elif [[ ${S[result_status]} == complete ]]; then
+        printf '%s\n' '结果：初始化完成，重启核验通过。'
+    elif [[ ${S[result_status]} == cleanup_pending ]]; then
+        printf '%s\n' '结果：配置核验通过，任务文件尚未清理完成。请使用同一版本 --resume。'
+    else printf '%s\n' '结果：尚未完成。后台可能仍在执行，请查看日志。'; fi
+    if [[ ${S[ntp_status]:-pending} == unsynchronized || ${S[ntp_status]:-pending} == unavailable ]]; then
+        printf '%s\n' '提醒：验收时尚未完成网络校时；系统继续使用当前时间。'
     fi
 }
 launch_worker() {
+    # Once a task exists, a failed systemd handoff is a task failure too.
+    trap 'on_worker_error "$?"' ERR
+    trap 'code=$?; if ((code!=0)); then on_worker_error "$code"; fi' EXIT
+    trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
     plain_root_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die 'Temporary service identity differs; it was not started.'
     systemctl daemon-reload || die 'Cannot reload the initialization service definition.'
     [[ $(systemctl show "$UNIT" -p FragmentPath --value) == "$UNIT_FILE" && -z $(systemctl show "$UNIT" -p DropInPaths --value) ]] || die 'Merged initialization service definition has an unexpected source or overrides; it was not started.'
     systemctl enable "$UNIT" || die 'Cannot enable initialization after reboot.'
     systemctl reset-failed "$UNIT" || die 'Cannot reset the initialization service failure.'
+    write_state_to "$RESULT"
     flock -u 9 || die 'Cannot release the initialization handoff lock.'
     exec 9<&- || die 'Cannot close the initialization handoff lock.'
     systemctl start --no-block "$UNIT" || die 'Cannot submit the initialization start request.'
-    printf '后台启动请求已提交。必要时会自动重启并续行，SSH 需要手动重新连接。\n首次断线后可先等待约 5–10 分钟再连接查询；这不是完成时限。\nNTP 无法同步时会警告并继续，完成摘要会记录 ntp_status。\n运行日志（成功后会清理）：\n  tail -f %s/next-vps-setup.log\n完成摘要：\n  cat %s\n只有有效摘要为 done / complete / failed=no 才表示全部必需步骤完成。\n' "$BASE" "$RESULT"
+    trap - ERR EXIT TERM HUP INT
+    nv_ui_launch "next-vps-setup $VERSION" '5–10' "$RESULT" "$BASE/next-vps-setup.log"
 }
 prepare_cleanup_recovery() {
     local entry=$1 file
@@ -913,11 +1392,12 @@ initialize_task() {
     [[ ! -e $JAIL && ! -L $JAIL && ! -e $BALLOON_CONF && ! -L $BALLOON_CONF ]] || die 'Existing initialization configuration found; this entry is for a fresh system.'
     fresh_fail2ban_preflight
     [[ -t 0 ]] || die 'First run requires an interactive terminal.'
-    printf '%s\n' '时间同步为尽力配置：不可用时会警告并继续，完成摘要会如实记录 NTP 状态。'
-    printf '请输入这台 VPS 的机器名: '; IFS= read -r name
-    validate_hostname "$name" || die 'Invalid hostname.'
-    printf '请输入当前 SSH 端口（只核验，不修改）: '; IFS= read -r port
-    validate_port "$port" || die 'Invalid SSH port.'
+    nv_ui_heading "next-vps-setup $VERSION · Debian 13 初始化"
+    printf '%s\n\n' '将更新官方软件包、配置基础防护，并自动重启验收。' 'SSH 账号、密码、端口和认证方式保持现有配置。' '网络校时不可用时会提醒并继续。请先确认备份和商家控制台可用。'
+    printf '机器名（例如 hk-vps）: '; IFS= read -r name
+    validate_hostname "$name" || die '机器名格式无效。请使用字母、数字、短横线或点，不要包含空格。'
+    printf '当前实际 SSH 端口（仅核验，不修改）: '; IFS= read -r port
+    validate_port "$port" || die 'SSH 端口无效。请输入 1 到 65535 的数字。'
     check_ssh "$port"; check_sources; check_resources
     case $(uname -r) in *-cloud-amd64) meta=linux-image-cloud-amd64 ;; *-amd64) meta=linux-image-amd64 ;; *) die 'Unrecognized kernel series.' ;; esac
     pkg=linux-image-$(uname -r)
@@ -937,7 +1417,7 @@ initialize_task() {
     printf '%s\n' "${S[task_id]}" > "$BASE/owner"
     install -m 0700 -- "$entry" "$WORKER"
     [[ $(file_sha "$WORKER") == "$hash" && $(file_sha "$entry") == "$hash" ]] || die 'Entry changed during preparation.'
-    save_state
+    save_state; write_state_to "$RESULT"
     publish_config "$UNIT_FILE" "$(unit_content)"
     launch_worker
 }
@@ -945,7 +1425,7 @@ initialize_task() {
 main() {
     local mode=${1:-start} entry
     (( $# <= 1 )) || die 'Use no arguments, --status, or --resume.'
-    case $mode in start|--status|--resume|--worker) ;; --help) printf '%s\n' "next-vps-setup v$VERSION" 'Run from /root as root: bash /root/next-vps-setup.sh [--status|--resume]'; return 0 ;; *) die 'Unknown argument.' ;; esac
+    case $mode in start|--status|--resume|--worker) ;; --help) printf '%s\n' "next-vps-setup $VERSION" '以 root 运行：bash /root/next-vps-setup.sh [--status|--resume]' '无参数开始初始化；--status 查看状态；修复失败原因后用 --resume 继续。'; return 0 ;; *) die '参数无效。使用 --help 查看用法。' ;; esac
     [[ $(id -u) == 0 ]] || die 'Root is required.'
     if [[ $mode == --status ]]; then
         if [[ -e $STATE_FILE || -L $STATE_FILE ]]; then
@@ -967,9 +1447,10 @@ main() {
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'State belongs to another machine.'
         print_status
         if [[ $mode == --resume ]]; then
-            [[ $(file_sha "$entry") == "${S[worker_sha]}" ]] || die 'Resume requires the same script version and payload.'
+            safe_entry_path "$entry" && [[ $entry == "${S[entry_path]}" && $(file_sha "$entry") == "${S[worker_sha]}" ]] || die '恢复任务需要原路径、相同内容的脚本文件。'
             if [[ ${S[phase]} == cleanup ]]; then prepare_cleanup_recovery "$entry"; return 0; fi
             verify_task_files
+            S[entry_identity]=$(file_identity "$entry"); S[entry_sha]=$(file_sha "$entry")
             S[failed]=no; save_state
             [[ -e $UNIT_FILE ]] || publish_config "$UNIT_FILE" "$(unit_content)"
             launch_worker
@@ -980,7 +1461,7 @@ main() {
         plain_root_file "$RESULT" && parse_state "$RESULT" || die 'Unsupported or invalid completion receipt; this fresh-install version does not migrate older releases.'
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'Receipt belongs to another machine.'
         print_status
-        if [[ ${S[result_status]} == complete ]]; then printf '%s\n' 'Already completed; no installation was repeated.'; return 0; fi
+        if [[ ${S[result_status]} == complete ]]; then printf '%s\n' '这台机器已完成初始化，本次没有重复修改系统。需要更新内核时，请使用内核维护工具。'; return 0; fi
         if [[ $mode == --resume ]]; then prepare_cleanup_recovery "$entry"; return 0; fi
         die 'Cleanup was interrupted after its durable receipt. Retain this receipt and inspect remaining task files before cleanup recovery.'
     fi
