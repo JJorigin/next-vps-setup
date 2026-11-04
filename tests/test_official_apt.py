@@ -81,10 +81,16 @@ class OfficialAptViewTests(unittest.TestCase):
         ), encoding="utf-8")
         self.host = self.root / "host"
         self.host.mkdir()
+        self.host_archives = self.root / "host-archives"
+        self.host_archives.mkdir()
+        self.cache_sentinel = self.host_archives / "business-package_1.0_amd64.deb"
+        self.cache_sentinel.write_bytes(b"host cache must remain untouched\n")
+        self.cache_before = self.cache_sentinel.read_bytes()
         self.sentinel = self.root / "hook-executed"
         self.host_config = self.host / "host.conf"
         self.host_config.write_text(
             f'Dir::State::status "{self.host / "untrusted-status"}";\n'
+            f'Dir::Cache::archives "{self.host_archives}";\n'
             f'Dir::Etc::parts "{self.host}";\n'
             'Acquire::http::Proxy "http://third-party.invalid:8080";\n'
             f'DPkg::Pre-Install-Pkgs {{ "touch {self.sentinel}"; }};\n'
@@ -109,7 +115,9 @@ declare -A S=([task_id]="$TASK_ID")
 BASE=$FIXTURE_ROOT/task
 stat() {
     if [[ ${1:-} == -c && ${2:-} == %u && ${!#} == "$FIXTURE_ROOT"* ]]; then
-        if [[ ${!#} == "${FIXTURE_NONROOT_PATH:-}" ]]; then printf '12345\n'; else printf '0\n'; fi
+        if [[ ${!#} == "${FIXTURE_NONROOT_PATH:-}" ]]; then printf '12345\n'
+        elif [[ ${!#} == "${FIXTURE_APT_OWNED_PATH:-}" ]]; then id -u _apt
+        else printf '0\n'; fi
     else command stat "$@"; fi
 }
 '''
@@ -126,6 +134,7 @@ stat() {
         )
         self.assertFalse(self.sentinel.exists(), "a host-config APT hook executed")
         self.assertEqual({p.name: p.read_bytes() for p in self.host.iterdir()}, self.host_before)
+        self.assertEqual(self.cache_sentinel.read_bytes(), self.cache_before, "host APT archives were changed")
         if check:
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return proc
@@ -156,7 +165,8 @@ stat() {
             self.assertIn(f'{key} "{value}";', dump)
         self.assertIn('Dir::State::status "/var/lib/dpkg/status";', dump)
         self.assertIn('Dir::State::extended_states "/var/lib/apt/extended_states";', dump)
-        self.assertIn('Dir::Cache::archives "/var/cache/apt/archives";', dump)
+        self.assertIn(f'Dir::Cache::archives "{self.view / "archives"}";', dump)
+        self.assertIn(f'Dir::Cache "{self.view}";', dump)
         self.assertIn('Dir::Bin::dpkg "/usr/bin/dpkg";', dump)
         self.assertIn('APT::Get::AutomaticRemove "false";', dump)
         self.assertIn('APT::Get::AllowUnauthenticated "false";', dump)
@@ -166,6 +176,7 @@ stat() {
         self.assertNotIn("hook-executed", dump)
         self.assertNotIn("untrusted-status", dump)
         self.assertNotIn("not-the-real-dpkg", dump)
+        self.assertNotIn(str(self.host_archives), dump)
 
     def test_print_uris_has_only_official_debian_suites_without_network(self) -> None:
         proc = self.run_shell("official_apt_prepare; official_apt_exec apt-get --print-uris update")
@@ -258,6 +269,186 @@ official_apt_exec /usr/bin/env
         self.run_shell("official_apt_prepare; official_apt_cleanup")
         self.assertFalse(self.view.exists())
 
+    def test_writable_index_files_are_rejected_without_deletion(self) -> None:
+        self.run_shell("official_apt_prepare")
+        name = "deb.debian.org_debian_dists_trixie_InRelease"
+        for directory in ("", "partial", "auxfiles"):
+            for mode in (0o664, 0o646):
+                with self.subTest(directory=directory, mode=oct(mode)):
+                    parent = self.view / "lists" / directory
+                    parent.mkdir(exist_ok=True, mode=0o755)
+                    path = parent / name
+                    path.write_text("must survive\n")
+                    path.chmod(mode)
+                    self.assertNotEqual(self.run_shell("official_apt_prepare", check=False).returncode, 0)
+                    self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+                    self.assertEqual(path.read_text(), "must survive\n")
+                    self.assertTrue((self.view / "owner").exists())
+                    path.unlink()
+
+    def test_sandbox_owned_final_index_is_rejected(self) -> None:
+        self.run_shell("official_apt_prepare")
+        path = self.view / "lists" / "deb.debian.org_debian_dists_trixie_InRelease"
+        path.write_text("synthetic index\n")
+        proc = self.run_shell(
+            f"FIXTURE_APT_OWNED_PATH={shlex.quote(str(path))}; official_apt_prepare", check=False
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(path.exists())
+
+    def test_sandbox_owned_partial_and_auxiliary_files_are_allowed(self) -> None:
+        self.run_shell("official_apt_prepare")
+        name = "deb.debian.org_debian_dists_trixie_InRelease"
+        for directory in ("partial", "auxfiles"):
+            with self.subTest(directory=directory):
+                parent = self.view / "lists" / directory
+                parent.mkdir(exist_ok=True, mode=0o755)
+                path = parent / name
+                path.write_text("incomplete download\n")
+                self.run_shell(f"FIXTURE_APT_OWNED_PATH={shlex.quote(str(path))}; official_apt_prepare")
+                path.unlink()
+
+    def test_root_owned_ims_partial_aliases_are_removed_without_touching_final_data(self) -> None:
+        name = "deb.debian.org_debian_dists_trixie_main_binary-amd64_Packages.lz4"
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                self.run_shell("official_apt_prepare")
+                final = self.view / "lists" / name
+                final.write_text("verified final index\n")
+                alias = self.view / "lists" / "partial" / name
+                alias.symlink_to("../" + name if relative else str(final))
+                self.run_shell("official_apt_prepare")
+                self.assertFalse(alias.is_symlink())
+                self.assertEqual(final.read_text(), "verified final index\n")
+                self.run_shell("official_apt_cleanup")
+                self.assertFalse(self.view.exists())
+
+    def test_cleanup_can_remove_owned_ims_aliases_directly(self) -> None:
+        self.run_shell("official_apt_prepare")
+        name = "deb.debian.org_debian_dists_trixie_main_binary-amd64_Packages.lz4"
+        final = self.view / "lists" / name
+        final.write_text("synthetic index\n")
+        (self.view / "lists" / "partial" / name).symlink_to(final)
+        self.run_shell("official_apt_cleanup")
+        self.assertFalse(self.view.exists())
+
+    def test_partial_alias_unknown_targets_and_nonroot_links_are_rejected(self) -> None:
+        self.run_shell("official_apt_prepare")
+        name = "deb.debian.org_debian_dists_trixie_main_binary-amd64_Packages.lz4"
+        final = self.view / "lists" / name
+        final.write_text("verified final index\n")
+        alias = self.view / "lists" / "partial" / name
+        for target in (str(self.host_config), "../../host/host.conf", str(final) + "\n"):
+            with self.subTest(target=target):
+                alias.symlink_to(target)
+                self.assertNotEqual(self.run_shell("official_apt_prepare", check=False).returncode, 0)
+                self.assertTrue(alias.is_symlink())
+                alias.unlink()
+        alias.symlink_to(final)
+        proc = self.run_shell(
+            f"FIXTURE_APT_OWNED_PATH={shlex.quote(str(alias))}; official_apt_prepare", check=False
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(final.read_text(), "verified final index\n")
+
+    def test_unknown_newline_filename_is_not_split_into_trusted_entries(self) -> None:
+        self.run_shell("official_apt_prepare")
+        prefix = "deb.debian.org_debian_dists_trixie_InRelease"
+        ordinary = self.view / "lists" / "partial" / prefix
+        ordinary.write_text("ordinary\n")
+        # The collector must retain the entire unusual filename and reject it
+        # before deleting any valid file from this task.
+        disguised = self.view / "lists" / "partial" / (prefix + "\nextra")
+        disguised.write_text("must survive\n")
+        self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+        self.assertEqual(disguised.read_text(), "must survive\n")
+        self.assertEqual(ordinary.read_text(), "ordinary\n")
+
+    def test_find_failure_is_not_hidden_by_process_substitution(self) -> None:
+        self.run_shell("official_apt_prepare")
+        proc = self.run_shell(r'''
+find() { command find "$@"; return 73; }
+official_apt_cleanup
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue((self.view / "owner").exists())
+        self.assertTrue((self.view / "official.sources").exists())
+
+    def test_find_failure_after_validation_does_not_delete_regular_files(self) -> None:
+        self.run_shell("official_apt_prepare")
+        self.run_shell(r'''
+find() {
+    if [[ -e $FIXTURE_ROOT/find-called ]]; then return 73; fi
+    : > "$FIXTURE_ROOT/find-called"
+    command find "$@"
+}
+if official_apt_cleanup; then exit 96; fi
+[[ -f $(official_apt_root)/owner && -f $(official_apt_root)/official.sources ]]
+''')
+
+    def test_private_archives_and_partial_downloads_are_cleaned_without_host_changes(self) -> None:
+        self.run_shell("official_apt_prepare")
+        archives = self.view / "archives"
+        for name in (
+            "curl_1%3a8.14.1-1_amd64.deb", "tzdata_2026e-0+deb13u1_all.deb",
+            "linux-image-6.12.115+deb13.1-cloud-amd64_6.12.115-2_amd64.deb",
+        ):
+            (archives / name).write_text("downloaded package\n")
+            (archives / "partial" / name).write_text("partial download\n")
+            (archives / "partial" / (name + ".FAILED")).write_text("failed download\n")
+        (archives / "lock").touch(mode=0o600)
+        self.run_shell("official_apt_prepare; official_apt_cleanup")
+        self.assertFalse(self.view.exists())
+        self.assertEqual(self.cache_sentinel.read_bytes(), self.cache_before)
+
+    def test_unknown_archives_entries_are_never_deleted(self) -> None:
+        self.run_shell("official_apt_prepare")
+        unknown = self.view / "archives" / "operator-notes.txt"
+        unknown.write_text("not owned by the task\n")
+        self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+        self.assertEqual(unknown.read_text(), "not owned by the task\n")
+        self.assertTrue((self.view / "owner").exists())
+
+    def test_writable_cached_packages_are_rejected_without_deletion(self) -> None:
+        self.run_shell("official_apt_prepare")
+        for directory in ("archives", "archives/partial"):
+            for mode in (0o664, 0o646):
+                with self.subTest(directory=directory, mode=oct(mode)):
+                    path = self.view / directory / "curl_8.14.1-1_amd64.deb"
+                    path.write_text("must survive\n")
+                    path.chmod(mode)
+                    self.assertNotEqual(self.run_shell("official_apt_prepare", check=False).returncode, 0)
+                    self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+                    self.assertEqual(path.read_text(), "must survive\n")
+                    path.unlink()
+
+    def test_final_packages_must_be_root_owned_but_partial_downloads_may_be_sandbox_owned(self) -> None:
+        self.run_shell("official_apt_prepare")
+        for directory in ("archives", "archives/partial"):
+            with self.subTest(directory=directory):
+                path = self.view / directory / "curl_8.14.1-1_amd64.deb"
+                path.write_text("synthetic package\n")
+                proc = self.run_shell(
+                    f"FIXTURE_APT_OWNED_PATH={shlex.quote(str(path))}; official_apt_prepare", check=False
+                )
+                if directory.endswith("partial"):
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                path.unlink()
+
+    def test_cached_package_symlinks_never_touch_external_targets(self) -> None:
+        self.run_shell("official_apt_prepare")
+        for directory in ("archives", "archives/partial"):
+            with self.subTest(directory=directory):
+                alias = self.view / directory / "curl_8.14.1-1_amd64.deb"
+                alias.symlink_to(self.cache_sentinel)
+                self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+                self.assertTrue(alias.is_symlink())
+                self.assertEqual(self.cache_sentinel.read_bytes(), self.cache_before)
+                alias.unlink()
+
     def test_private_root_mode_must_allow_sandbox_traversal(self) -> None:
         self.run_shell("official_apt_prepare")
         self.view.chmod(0o700)
@@ -289,7 +480,10 @@ official_apt_exec /usr/bin/env
     def test_arbitrary_keyring_link_targets_are_rejected(self) -> None:
         other = self.keyring_dir / "other.gpg"
         other.write_bytes(self.keyring_target.read_bytes())
-        for target in (other.name, str(other), "../keyrings/debian-archive-keyring.pgp"):
+        for target in (
+            other.name, str(other), "../keyrings/debian-archive-keyring.pgp",
+            self.keyring_target.name + "\n", str(self.keyring_target) + "\n",
+        ):
             with self.subTest(target=target):
                 self.keyring.unlink()
                 self.keyring.symlink_to(target)

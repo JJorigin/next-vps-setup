@@ -23,7 +23,8 @@ official_apt_keyring_target() {
         # Debian 13 ships this one compatibility link. Other APT files remain
         # subject to the no-symlink rule in official_apt_file_ok.
         [[ $(stat -c %u -- "$keyring") == 0 ]] || return 1
-        link=$(readlink -- "$keyring") || return 1
+        link=$(readlink -n -- "$keyring" && printf '.') || return 1
+        link=${link%.}
         case $link in
             debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.pgp)
                 target=/usr/share/keyrings/debian-archive-keyring.pgp ;;
@@ -77,8 +78,8 @@ Dir::State "/var/lib/apt";
 Dir::State::status "/var/lib/dpkg/status";
 Dir::State::extended_states "/var/lib/apt/extended_states";
 Dir::State::lists "$root/lists";
-Dir::Cache "/var/cache/apt";
-Dir::Cache::archives "/var/cache/apt/archives";
+Dir::Cache "$root";
+Dir::Cache::archives "$root/archives";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
 Dir::Log "/var/log/apt";
@@ -119,30 +120,106 @@ official_apt_publish() {
     if ! mv -T -- "$tmp" "$path"; then rm -- "$tmp" || true; return 1; fi
     sync -f "${path%/*}"
 }
+official_apt_index_name_ok() {
+    [[ $1 =~ ^(deb\.debian\.org_debian_dists_trixie(-updates)?|security\.debian\.org_debian-security_dists_trixie-security)_[a-zA-Z0-9_.%+~-]+$ ]]
+}
+
+official_apt_archive_name_ok() {
+    local suffix='[.]deb'
+    [[ ${2:-final} != partial ]] || suffix+='([.]FAILED)?'
+    [[ $1 =~ ^[a-z0-9][a-z0-9.+-]*_[a-zA-Z0-9.+:%~-]+_(all|amd64)$suffix$ ]]
+}
+
+official_apt_download_file_ok() {
+    local uid mode apt_uid
+    [[ -f $1 && ! -L $1 && $(stat -c %h -- "$1") == 1 ]] || return 1
+    uid=$(stat -c %u -- "$1"); mode=$(stat -c %a -- "$1"); apt_uid=$(id -u _apt) || return 1
+    [[ $uid == 0 || $uid == "$apt_uid" ]] || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+
+official_apt_collect_paths() {
+    local root=$1 fd producer failed=no
+    local -n collected=$2
+    # Wait for find explicitly: process-substitution failures do not otherwise
+    # propagate through mapfile/while. Keep names NUL-delimited throughout.
+    exec {fd}< <(find -P "$root" -xdev -mindepth 1 -print0) || return 1
+    producer=$!
+    mapfile -d '' -t collected <&"$fd" || failed=yes
+    exec {fd}<&- || failed=yes
+    wait "$producer" || failed=yes
+    [[ $failed == no ]]
+}
+
+official_apt_partial_link_ok() {
+    local path=$1 root name target link
+    root=$(official_apt_root)
+    [[ $path == "$root/lists/partial/"* && -L $path && $(stat -c %u -- "$path") == 0 && $(stat -c %h -- "$path") == 1 ]] || return 1
+    name=${path#"$root/lists/partial/"}
+    official_apt_index_name_ok "$name" || return 1
+    target=$root/lists/$name
+    # APT's root controller creates this direct IMS-hit alias. No other
+    # symlink, link chain, or path outside this task's final list is accepted.
+    link=$(readlink -n -- "$path" && printf '.') || return 1
+    link=${link%.}
+    [[ $link == "$target" || $link == "../$name" ]] || return 1
+    official_apt_file_ok "$target" || return 1
+}
+
+official_apt_clear_partial_links() {
+    local root path
+    root=$(official_apt_root)
+    for path in "$root/lists/partial"/* "$root/lists/partial"/.[!.]* "$root/lists/partial"/..?*; do
+        [[ -L $path ]] || continue
+        official_apt_partial_link_ok "$path" || return 1
+        rm -- "$path" || return 1
+    done
+}
+
 official_apt_check_tree() {
-    local root path relative uid apt_uid listing
+    local root path relative name
+    local -a paths=()
     root=$(official_apt_root)
     official_apt_dir_ok "$root" || return 1
-    apt_uid=$(id -u _apt) || return 1
-    listing=$(find -P "$root" -xdev -mindepth 1 -print) || return 1
-    while IFS= read -r path; do
-        [[ -n $path ]] || continue
+    official_apt_collect_paths "$root" paths || return 1
+    for path in "${paths[@]}"; do
         relative=${path#"$root"/}
         case $relative in
             owner|apt.conf|empty.conf|official.sources|preferences|auth.conf)
                 official_apt_file_ok "$path" || return 1 ;;
-            parts|sourceparts|preferencesparts|trustedparts|authparts|lists)
+            parts|sourceparts|preferencesparts|trustedparts|authparts|lists|archives)
                 official_apt_dir_ok "$path" || return 1 ;;
-            lists/partial|lists/auxfiles)
+            lists/partial|lists/auxfiles|archives/partial)
                 official_apt_dir_ok "$path" download || return 1 ;;
             lists/*)
-                [[ $relative =~ ^lists/(partial/|auxfiles/)?(lock|deb\.debian\.org_debian_dists_trixie[-a-zA-Z0-9_.%+~]*|security\.debian\.org_debian-security_dists_trixie-security[-a-zA-Z0-9_.%+~]*)$ ]] || return 1
-                [[ -f $path && ! -L $path && $(stat -c %h -- "$path") == 1 ]] || return 1
-                uid=$(stat -c %u -- "$path") || return 1
-                [[ $uid == 0 || $uid == "$apt_uid" ]] || return 1 ;;
+                name=${relative##*/}
+                [[ $name == lock ]] || official_apt_index_name_ok "$name" || return 1
+                case $relative in
+                    lists/partial/*|lists/auxfiles/*)
+                        [[ $relative == "lists/partial/$name" || $relative == "lists/auxfiles/$name" ]] || return 1
+                        if [[ -L $path ]]; then official_apt_partial_link_ok "$path" || return 1
+                        else
+                            official_apt_download_file_ok "$path" || return 1
+                        fi ;;
+                    *)
+                        [[ $relative == "lists/$name" ]] || return 1
+                        official_apt_file_ok "$path" || return 1 ;;
+                esac ;;
+            archives/*)
+                name=${relative##*/}
+                case $relative in
+                    archives/partial/*)
+                        [[ $relative == "archives/partial/$name" ]] || return 1
+                        [[ $name == lock ]] || official_apt_archive_name_ok "$name" partial || return 1
+                        official_apt_download_file_ok "$path" || return 1 ;;
+                    *)
+                        [[ $relative == "archives/$name" ]] || return 1
+                        [[ $name == lock ]] || official_apt_archive_name_ok "$name" || return 1
+                        official_apt_file_ok "$path" || return 1 ;;
+                esac ;;
             *) return 1 ;;
         esac
-    done <<< "$listing"
+    done
 }
 official_apt_prepare() {
     local root directory content
@@ -156,9 +233,9 @@ official_apt_prepare() {
         [[ -z $(find -P "$root" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'Unowned private APT data exists.'
     fi
     official_apt_publish "$root/owner" "${S[task_id]}"$'\n'
-    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial; do
+    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial archives archives/partial; do
         if [[ ! -e $root/$directory && ! -L $root/$directory ]]; then mkdir -m 0755 -- "$root/$directory"; fi
-        case $directory in lists/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
+        case $directory in lists/partial|archives/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
     done
     official_apt_publish "$root/empty.conf" ''
     official_apt_publish "$root/preferences" ''
@@ -166,6 +243,7 @@ official_apt_prepare() {
     content=$(official_apt_sources_content); official_apt_publish "$root/official.sources" "$content"$'\n'
     content=$(official_apt_config_content); official_apt_publish "$root/apt.conf" "$content"$'\n'
     official_apt_check_tree || die '更新暂存目录出现未知内容或权限变化，已停止，请保留现场检查。'
+    official_apt_clear_partial_links || die '无法安全清理本次官方索引的中断链接，请保留现场检查。'
 }
 official_apt_exec() {
     local tool=$1 root; shift
@@ -218,13 +296,18 @@ official_apt_recover_indexes() {
 }
 official_apt_cleanup() {
     local root path
+    local -a paths=()
     root=$(official_apt_root)
     [[ -e $root || -L $root ]] || return 0
     official_apt_file_ok "$root/owner" && [[ $(cat "$root/owner") == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
     official_apt_check_tree || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+    official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
     # Delete only the previously checked regular files; never recurse with rm.
-    while IFS= read -r -d '' path; do rm -- "$path" || return 1; done < <(find -P "$root" -xdev -type f ! -name owner -print0)
-    for path in lists/partial lists/auxfiles lists parts sourceparts preferencesparts trustedparts authparts; do
+    official_apt_collect_paths "$root" paths || return 1
+    for path in "${paths[@]}"; do
+        [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
+    done
+    for path in lists/partial lists/auxfiles lists archives/partial archives parts sourceparts preferencesparts trustedparts authparts; do
         [[ ! -d $root/$path ]] || rmdir -- "$root/$path" || return 1
     done
     rm -- "$root/owner" || return 1

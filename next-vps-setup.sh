@@ -1,5 +1,5 @@
 #!/bin/bash
-# next-vps-setup v1.1.1 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v1.2 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
@@ -30,9 +30,12 @@ SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
 SWAP_BYTES=1073741824
 SWAP_RESERVE_KIB=1048576
-VERSION=1.1.1
+VERSION=1.2
 declare -A S=()
 IN_REBOOT=no
+BOOTSTRAP_BASE_ID=
+BOOTSTRAP_TEMP=
+BOOTSTRAP_TEMP_ID=
 
 # BEGIN EMBEDDED user-interface
 # Shared terminal messages; embedded into each downloadable script.
@@ -349,6 +352,18 @@ validate_hostname() {
         [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
     done
 }
+kernel_meta_for_abi() {
+    local abi=$1
+    # Official Debian 13 stable ABIs use either an early numeric ABI suffix
+    # or the +deb13[.N] form. Do not silently replace another kernel flavour.
+    if [[ $abi =~ ^6\.12\.[0-9]+(-[0-9]+|\+deb13(\.[0-9]+)?)?-cloud-amd64$ ]]; then
+        printf 'linux-image-cloud-amd64\n'
+    elif [[ $abi =~ ^6\.12\.[0-9]+(-[0-9]+|\+deb13(\.[0-9]+)?)?-amd64$ ]]; then
+        printf 'linux-image-amd64\n'
+    else
+        return 1
+    fi
+}
 boot_transition() {
     local before=$1 now=$2 count=$3 target=$4 running=$5
     validate_boot_id "$before" && validate_boot_id "$now" || return 1
@@ -374,6 +389,16 @@ plain_root_file() {
     [[ -f $path && ! -L $path && $(stat -c %u -- "$path") == 0 ]] || return 1
     mode=$(stat -c %a -- "$path") || return 1
     [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+safe_state_parent() {
+    local path=$1 mode
+    while :; do
+        [[ -d $path && ! -L $path && $(stat -c %u -- "$path") == 0 ]] || return 1
+        mode=$(stat -c %a -- "$path") || return 1
+        [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 )) || return 1
+        [[ $path != / ]] || break
+        path=${path%/*}; [[ -n $path ]] || path=/
+    done
 }
 safe_entry_path() {
     local path=$1 parent
@@ -450,6 +475,7 @@ validate_state() {
         validate_boot_id "${S[boot_before]}" && [[ ${S[reboot_count]} != 0 && ${S[target_kernel]} != - ]] || return 1
     fi
     [[ ${S[phase]} == swap || ${S[phase]} == update || ${S[target_kernel]} != - ]] || return 1
+    [[ ${S[target_kernel]} == - || $(kernel_meta_for_abi "${S[target_kernel]}") == "${S[kernel_meta]}" ]] || return 1
     [[ ${S[reboot_wait]} == none || ${S[reboot_wait]} == "${S[phase]}" ]] || return 1
     case ${S[result_status]} in
         complete) [[ ${S[phase]} == "done" && ${S[failed]} == no ]] || return 1 ;;
@@ -595,7 +621,8 @@ official_apt_keyring_target() {
         # Debian 13 ships this one compatibility link. Other APT files remain
         # subject to the no-symlink rule in official_apt_file_ok.
         [[ $(stat -c %u -- "$keyring") == 0 ]] || return 1
-        link=$(readlink -- "$keyring") || return 1
+        link=$(readlink -n -- "$keyring" && printf '.') || return 1
+        link=${link%.}
         case $link in
             debian-archive-keyring.pgp|/usr/share/keyrings/debian-archive-keyring.pgp)
                 target=/usr/share/keyrings/debian-archive-keyring.pgp ;;
@@ -649,8 +676,8 @@ Dir::State "/var/lib/apt";
 Dir::State::status "/var/lib/dpkg/status";
 Dir::State::extended_states "/var/lib/apt/extended_states";
 Dir::State::lists "$root/lists";
-Dir::Cache "/var/cache/apt";
-Dir::Cache::archives "/var/cache/apt/archives";
+Dir::Cache "$root";
+Dir::Cache::archives "$root/archives";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
 Dir::Log "/var/log/apt";
@@ -691,30 +718,106 @@ official_apt_publish() {
     if ! mv -T -- "$tmp" "$path"; then rm -- "$tmp" || true; return 1; fi
     sync -f "${path%/*}"
 }
+official_apt_index_name_ok() {
+    [[ $1 =~ ^(deb\.debian\.org_debian_dists_trixie(-updates)?|security\.debian\.org_debian-security_dists_trixie-security)_[a-zA-Z0-9_.%+~-]+$ ]]
+}
+
+official_apt_archive_name_ok() {
+    local suffix='[.]deb'
+    [[ ${2:-final} != partial ]] || suffix+='([.]FAILED)?'
+    [[ $1 =~ ^[a-z0-9][a-z0-9.+-]*_[a-zA-Z0-9.+:%~-]+_(all|amd64)$suffix$ ]]
+}
+
+official_apt_download_file_ok() {
+    local uid mode apt_uid
+    [[ -f $1 && ! -L $1 && $(stat -c %h -- "$1") == 1 ]] || return 1
+    uid=$(stat -c %u -- "$1"); mode=$(stat -c %a -- "$1"); apt_uid=$(id -u _apt) || return 1
+    [[ $uid == 0 || $uid == "$apt_uid" ]] || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+
+official_apt_collect_paths() {
+    local root=$1 fd producer failed=no
+    local -n collected=$2
+    # Wait for find explicitly: process-substitution failures do not otherwise
+    # propagate through mapfile/while. Keep names NUL-delimited throughout.
+    exec {fd}< <(find -P "$root" -xdev -mindepth 1 -print0) || return 1
+    producer=$!
+    mapfile -d '' -t collected <&"$fd" || failed=yes
+    exec {fd}<&- || failed=yes
+    wait "$producer" || failed=yes
+    [[ $failed == no ]]
+}
+
+official_apt_partial_link_ok() {
+    local path=$1 root name target link
+    root=$(official_apt_root)
+    [[ $path == "$root/lists/partial/"* && -L $path && $(stat -c %u -- "$path") == 0 && $(stat -c %h -- "$path") == 1 ]] || return 1
+    name=${path#"$root/lists/partial/"}
+    official_apt_index_name_ok "$name" || return 1
+    target=$root/lists/$name
+    # APT's root controller creates this direct IMS-hit alias. No other
+    # symlink, link chain, or path outside this task's final list is accepted.
+    link=$(readlink -n -- "$path" && printf '.') || return 1
+    link=${link%.}
+    [[ $link == "$target" || $link == "../$name" ]] || return 1
+    official_apt_file_ok "$target" || return 1
+}
+
+official_apt_clear_partial_links() {
+    local root path
+    root=$(official_apt_root)
+    for path in "$root/lists/partial"/* "$root/lists/partial"/.[!.]* "$root/lists/partial"/..?*; do
+        [[ -L $path ]] || continue
+        official_apt_partial_link_ok "$path" || return 1
+        rm -- "$path" || return 1
+    done
+}
+
 official_apt_check_tree() {
-    local root path relative uid apt_uid listing
+    local root path relative name
+    local -a paths=()
     root=$(official_apt_root)
     official_apt_dir_ok "$root" || return 1
-    apt_uid=$(id -u _apt) || return 1
-    listing=$(find -P "$root" -xdev -mindepth 1 -print) || return 1
-    while IFS= read -r path; do
-        [[ -n $path ]] || continue
+    official_apt_collect_paths "$root" paths || return 1
+    for path in "${paths[@]}"; do
         relative=${path#"$root"/}
         case $relative in
             owner|apt.conf|empty.conf|official.sources|preferences|auth.conf)
                 official_apt_file_ok "$path" || return 1 ;;
-            parts|sourceparts|preferencesparts|trustedparts|authparts|lists)
+            parts|sourceparts|preferencesparts|trustedparts|authparts|lists|archives)
                 official_apt_dir_ok "$path" || return 1 ;;
-            lists/partial|lists/auxfiles)
+            lists/partial|lists/auxfiles|archives/partial)
                 official_apt_dir_ok "$path" download || return 1 ;;
             lists/*)
-                [[ $relative =~ ^lists/(partial/|auxfiles/)?(lock|deb\.debian\.org_debian_dists_trixie[-a-zA-Z0-9_.%+~]*|security\.debian\.org_debian-security_dists_trixie-security[-a-zA-Z0-9_.%+~]*)$ ]] || return 1
-                [[ -f $path && ! -L $path && $(stat -c %h -- "$path") == 1 ]] || return 1
-                uid=$(stat -c %u -- "$path") || return 1
-                [[ $uid == 0 || $uid == "$apt_uid" ]] || return 1 ;;
+                name=${relative##*/}
+                [[ $name == lock ]] || official_apt_index_name_ok "$name" || return 1
+                case $relative in
+                    lists/partial/*|lists/auxfiles/*)
+                        [[ $relative == "lists/partial/$name" || $relative == "lists/auxfiles/$name" ]] || return 1
+                        if [[ -L $path ]]; then official_apt_partial_link_ok "$path" || return 1
+                        else
+                            official_apt_download_file_ok "$path" || return 1
+                        fi ;;
+                    *)
+                        [[ $relative == "lists/$name" ]] || return 1
+                        official_apt_file_ok "$path" || return 1 ;;
+                esac ;;
+            archives/*)
+                name=${relative##*/}
+                case $relative in
+                    archives/partial/*)
+                        [[ $relative == "archives/partial/$name" ]] || return 1
+                        [[ $name == lock ]] || official_apt_archive_name_ok "$name" partial || return 1
+                        official_apt_download_file_ok "$path" || return 1 ;;
+                    *)
+                        [[ $relative == "archives/$name" ]] || return 1
+                        [[ $name == lock ]] || official_apt_archive_name_ok "$name" || return 1
+                        official_apt_file_ok "$path" || return 1 ;;
+                esac ;;
             *) return 1 ;;
         esac
-    done <<< "$listing"
+    done
 }
 official_apt_prepare() {
     local root directory content
@@ -728,9 +831,9 @@ official_apt_prepare() {
         [[ -z $(find -P "$root" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'Unowned private APT data exists.'
     fi
     official_apt_publish "$root/owner" "${S[task_id]}"$'\n'
-    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial; do
+    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial archives archives/partial; do
         if [[ ! -e $root/$directory && ! -L $root/$directory ]]; then mkdir -m 0755 -- "$root/$directory"; fi
-        case $directory in lists/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
+        case $directory in lists/partial|archives/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
     done
     official_apt_publish "$root/empty.conf" ''
     official_apt_publish "$root/preferences" ''
@@ -738,6 +841,7 @@ official_apt_prepare() {
     content=$(official_apt_sources_content); official_apt_publish "$root/official.sources" "$content"$'\n'
     content=$(official_apt_config_content); official_apt_publish "$root/apt.conf" "$content"$'\n'
     official_apt_check_tree || die '更新暂存目录出现未知内容或权限变化，已停止，请保留现场检查。'
+    official_apt_clear_partial_links || die '无法安全清理本次官方索引的中断链接，请保留现场检查。'
 }
 official_apt_exec() {
     local tool=$1 root; shift
@@ -790,13 +894,18 @@ official_apt_recover_indexes() {
 }
 official_apt_cleanup() {
     local root path
+    local -a paths=()
     root=$(official_apt_root)
     [[ -e $root || -L $root ]] || return 0
     official_apt_file_ok "$root/owner" && [[ $(cat "$root/owner") == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
     official_apt_check_tree || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+    official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
     # Delete only the previously checked regular files; never recurse with rm.
-    while IFS= read -r -d '' path; do rm -- "$path" || return 1; done < <(find -P "$root" -xdev -type f ! -name owner -print0)
-    for path in lists/partial lists/auxfiles lists parts sourceparts preferencesparts trustedparts authparts; do
+    official_apt_collect_paths "$root" paths || return 1
+    for path in "${paths[@]}"; do
+        [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
+    done
+    for path in lists/partial lists/auxfiles lists archives/partial archives parts sourceparts preferencesparts trustedparts authparts; do
         [[ ! -d $root/$path ]] || rmdir -- "$root/$path" || return 1
     done
     rm -- "$root/owner" || return 1
@@ -804,6 +913,53 @@ official_apt_cleanup() {
     sync -f "${root%/*}"
 }
 # END NEXT-VPS OFFICIAL APT VIEW
+# BEGIN EMBEDDED kernel-identity
+# Confirm the running amd64 build, including upgrades that reuse an ABI name.
+# File trust/ownership is checked by the caller before this read-only helper.
+nv_kernel_image_matches() {
+    /usr/bin/python3 -I - "$1" "$2" "$3" <<'NEXT_VPS_KERNEL_IDENTITY'
+import os
+import stat
+import struct
+import sys
+
+def check(path, release, version):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
+            raise ValueError("unsafe kernel image type or permissions")
+        with os.fdopen(fd, "rb", closefd=False) as image:
+            header = image.read(0x210)
+            if (len(header) != 0x210 or header[0x1fe:0x200] != b"\x55\xaa"
+                    or header[0x202:0x206] != b"HdrS"
+                    or struct.unpack_from("<H", header, 0x206)[0] < 0x200):
+                raise ValueError("unsupported x86 boot header")
+            setup_end = ((header[0x1f1] or 4) + 1) * 512
+            offset = 0x200 + struct.unpack_from("<H", header, 0x20e)[0]
+            if not 0x210 <= offset < min(setup_end, metadata.st_size):
+                raise ValueError("invalid kernel version pointer")
+            image.seek(offset)
+            raw = image.read(min(512, setup_end - offset, metadata.st_size - offset))
+            if b"\0" not in raw:
+                raise ValueError("unterminated kernel version")
+            banner = raw.split(b"\0", 1)[0]
+            if not banner or any(byte < 32 or byte > 126 for byte in banner):
+                raise ValueError("invalid kernel version text")
+            banner = banner.decode("ascii")
+            if not (banner.startswith(release + " (") and banner.endswith(") " + version)):
+                raise ValueError("running kernel build differs from the target boot image")
+    finally:
+        os.close(fd)
+
+try:
+    check(*sys.argv[1:])
+except (OSError, ValueError, struct.error) as error:
+    print("KERNEL_IDENTITY_ERROR: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+NEXT_VPS_KERNEL_IDENTITY
+}
+# END EMBEDDED kernel-identity
 
 apt_install() { apt_run install -y --no-remove --no-install-recommends "$@"; }
 candidate_has_index() {
@@ -830,6 +986,7 @@ set_target_kernel() {
     pkg=${dependency%% *}
     [[ $pkg =~ ^linux-image-(6\.12\.[a-zA-Z0-9.+~-]+-amd64)$ ]] || die 'Unexpected official kernel metapackage dependency.'
     S[target_kernel]=${BASH_REMATCH[1]}
+    [[ $(kernel_meta_for_abi "${S[target_kernel]}") == "${S[kernel_meta]}" ]] || die 'Kernel metapackage would change the original kernel flavour.'
     installed "$pkg" || die 'Target kernel package is not fully installed.'
     [[ -f /boot/vmlinuz-${S[target_kernel]} && -f /boot/initrd.img-${S[target_kernel]} && -r /boot/config-${S[target_kernel]} ]] || die 'Target kernel boot files are missing.'
     check_candidate "$pkg"
@@ -863,11 +1020,11 @@ swap_owner_content() {
     printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "$SWAP_BYTES"
 }
 swap_unit_content() {
-    printf '%s\n' '# Managed by next-vps-setup v1.1.1' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
+    printf '%s\n' '# Managed by next-vps-setup v1.2' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
         '' '[Swap]' "What=$SWAP_FILE" 'Priority=10' 'TimeoutSec=90s' \
         '' '[Install]' 'WantedBy=swap.target'
 }
-swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.1.1' 'vm.swappiness = 10'; }
+swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.2' 'vm.swappiness = 10'; }
 swap_mount_field() {
     local value
     value=$(findmnt --raw --noheadings --first-only --output "$1" --target /var/lib) || die 'Cannot inspect the Swap filesystem.'
@@ -1040,7 +1197,7 @@ publish_config() {
 }
 jail_content() {
     cat <<'JAIL_HEADER'
-# Managed by next-vps-setup v1.1.1
+# Managed by next-vps-setup v1.2
 [sshd]
 enabled = true
 JAIL_HEADER
@@ -1055,7 +1212,7 @@ bantime = -1
 action = nftables[type=multiport, name=sshd, port="%(port)s", protocol=tcp, table=f2b-next-vps-setup]
 JAIL_BODY
 }
-balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.1.1' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
+balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.2' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
 configure_hostname() {
     if [[ $(hostnamectl --static) != "${S[hostname]}" ]]; then hostnamectl set-hostname "${S[hostname]}"; dirty; fi
     if ! getent hosts "${S[hostname]}" >/dev/null; then
@@ -1222,6 +1379,7 @@ phase_balloon() {
 verify_all() {
     official_apt_recover_indexes
     [[ $(uname -r) == "${S[target_kernel]}" ]] || die 'Running kernel differs from target.'
+    plain_root_file "/boot/vmlinuz-${S[target_kernel]}" && nv_kernel_image_matches "/boot/vmlinuz-${S[target_kernel]}" "$(uname -r)" "$(uname -v)" || die 'Running kernel build differs from the target boot image.'
     check_candidate "${S[kernel_meta]}"; check_candidate "linux-image-${S[target_kernel]}"
     check_ssh "${S[ssh_port]}"
     [[ $(hostnamectl --static) == "${S[hostname]}" ]] && getent hosts "${S[hostname]}" >/dev/null || die 'Hostname did not persist.'
@@ -1274,8 +1432,11 @@ cleanup_success() {
     apt_run clean
     if [[ -e $UNIT_FILE || -L $UNIT_FILE ]]; then
         plain_root_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die 'Temporary unit was changed; it was not removed.'
-        systemctl disable "$UNIT"
-        rm -- "$UNIT_FILE"; systemctl daemon-reload
+        # Do not reload a still-running oneshot after removing its definition:
+        # systemd can replace TimeoutStartSec=infinity with the manager default
+        # and kill a legitimate long-running cleanup. No unit file remains.
+        systemctl --no-reload disable "$UNIT"
+        rm -- "$UNIT_FILE"
     fi
     # Functional recheck occurs before deleting any recovery source or entry.
     verify_all
@@ -1325,12 +1486,20 @@ on_worker_error() {
     trap - ERR EXIT TERM HUP INT
     if [[ ${IN_REBOOT:-no} == yes && $code == 143 ]]; then exit 0; fi
     [[ $code != 0 ]] || code=1
+    bootstrap_temp_cleanup || printf '%s\n' 'Bootstrap temporary file identity changed; it was retained for inspection.' >&2
+    if [[ -n ${BOOTSTRAP_BASE_ID:-} && -d $BASE && ! -L $BASE &&
+          $(file_identity "$BASE") == "$BOOTSTRAP_BASE_ID" && ! -e $BASE/owner && ! -L $BASE/owner ]]; then
+        rmdir -- "$BASE" 2>/dev/null || true
+    fi
     nv_ui_heading '初始化未完成 · 已停止自动执行' >&2
     printf '出错阶段：%s\n查看原因：tail -n 100 %s/next-vps-setup.log\n修复后恢复：bash %s --resume\n' "$(nv_ui_stage_name "${S[phase]:-unknown}")" "$BASE" "${S[entry_path]:-/root/next-vps-setup.sh}" >&2
     if [[ -n ${S[phase]:-} ]]; then
         if [[ ${S[result_status]:-} == complete ]]; then S[phase]=cleanup; S[result_status]=cleanup_pending; fi
         S[failed]=yes
-        if [[ -d $BASE ]]; then save_state || true; fi
+        if [[ -e $STATE_FILE ]] && bootstrap_dir_ok && plain_root_file "$BASE/owner" &&
+           [[ $(cat "$BASE/owner") == "${S[task_id]}" ]] && plain_root_file "$STATE_FILE"; then
+            save_state || true
+        fi
         if write_state_to "$RESULT"; then
             publish_login_notice failure || printf '%s\n' '提醒：首次登录通知未能保存，请使用结果查询命令查看失败状态。' >&2
         fi
@@ -1392,11 +1561,89 @@ launch_worker() {
     trap - ERR EXIT TERM HUP INT
     nv_ui_launch "next-vps-setup $VERSION" '5–10' "$RESULT" "$BASE/next-vps-setup.log"
 }
+bootstrap_dir_ok() {
+    [[ -d $BASE && ! -L $BASE && $(readlink -e -- "$BASE") == "$BASE" &&
+       $(stat -c %u -- "$BASE") == 0 && $(stat -c %a -- "$BASE") == 700 ]]
+}
+bootstrap_temp_cleanup() {
+    [[ -n ${BOOTSTRAP_TEMP:-} ]] || return 0
+    [[ $BOOTSTRAP_TEMP == "$BASE"/.bootstrap-* && -n ${BOOTSTRAP_TEMP_ID:-} ]] || return 1
+    if [[ -e $BOOTSTRAP_TEMP || -L $BOOTSTRAP_TEMP ]]; then
+        plain_root_file "$BOOTSTRAP_TEMP" && [[ $(stat -c %h -- "$BOOTSTRAP_TEMP") == 1 &&
+            $(file_identity "$BOOTSTRAP_TEMP") == "$BOOTSTRAP_TEMP_ID" ]] || return 1
+        rm -- "$BOOTSTRAP_TEMP" || return 1
+    fi
+    BOOTSTRAP_TEMP=; BOOTSTRAP_TEMP_ID=
+}
+bootstrap_temp_create() {
+    [[ -z ${BOOTSTRAP_TEMP:-} ]] || die 'A bootstrap temporary file is already tracked.'
+    BOOTSTRAP_TEMP=$(mktemp "$BASE/.bootstrap-$1.XXXXXX") || return 1
+    BOOTSTRAP_TEMP_ID=$(file_identity "$BOOTSTRAP_TEMP") || return 1
+}
+write_owner() {
+    [[ ! -e $BASE/owner && ! -L $BASE/owner ]] || die 'An owner marker already exists; it was not overwritten.'
+    bootstrap_temp_create owner
+    if ! printf '%s\n' "${S[task_id]}" > "$BOOTSTRAP_TEMP" || ! chmod 0600 "$BOOTSTRAP_TEMP" || ! sync -f "$BOOTSTRAP_TEMP"; then
+        bootstrap_temp_cleanup || true; die 'Cannot prepare the task owner marker.'
+    fi
+    if ! mv -T -- "$BOOTSTRAP_TEMP" "$BASE/owner"; then bootstrap_temp_cleanup || true; die 'Cannot publish the task owner marker.'; fi
+    BOOTSTRAP_TEMP=; BOOTSTRAP_TEMP_ID=
+    sync -f "$BASE"
+}
+copy_worker() {
+    local entry=$1
+    [[ ! -e $WORKER && ! -L $WORKER ]] || die 'A worker already exists; it was not overwritten.'
+    bootstrap_temp_create worker
+    if ! cp -- "$entry" "$BOOTSTRAP_TEMP" || ! chmod 0700 "$BOOTSTRAP_TEMP" ||
+       [[ $(file_sha "$BOOTSTRAP_TEMP") != "${S[worker_sha]}" || $(file_sha "$entry") != "${S[worker_sha]}" ]] || ! sync -f "$BOOTSTRAP_TEMP"; then
+        bootstrap_temp_cleanup || true; die 'Cannot prepare an identical task worker.'
+    fi
+    if ! mv -T -- "$BOOTSTRAP_TEMP" "$WORKER"; then bootstrap_temp_cleanup || true; die 'Cannot publish the task worker.'; fi
+    BOOTSTRAP_TEMP=; BOOTSTRAP_TEMP_ID=
+    sync -f "$BASE"
+}
+bootstrap_pending() {
+    [[ ${S[phase]} == swap && ${S[result_status]} == running && ${S[target_kernel]} == - &&
+       ${S[swap_status]} == pending && ${S[swap_uuid]} == - && ${S[swap_identity]} == - &&
+       ${S[reboot_count]} == 0 && ${S[reboot_wait]} == none && ${S[boot_before]} == - &&
+       ${S[balloon]} == pending && ${S[ntp_status]} == pending && ${S[entry_sha]} == "${S[worker_sha]}" ]]
+}
+prepare_bootstrap_recovery() {
+    local entry=$1 file
+    bootstrap_pending || die 'Receipt is not an initial bootstrap recovery point.'
+    [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'Bootstrap belongs to another machine.'
+    safe_entry_path "$entry" && [[ $entry == "${S[entry_path]}" && $(file_sha "$entry") == "${S[worker_sha]}" ]] || die 'Bootstrap recovery requires the original path and identical payload.'
+    trap 'on_worker_error "$?"' ERR
+    trap 'code=$?; if ((code!=0)); then on_worker_error "$code"; fi' EXIT
+    trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
+    if [[ ! -e $BASE && ! -L $BASE ]]; then
+        [[ ! -e $UNIT_FILE && ! -L $UNIT_FILE ]] || die 'A service without its bootstrap directory requires inspection.'
+        mkdir -m 0700 -- "$BASE"; BOOTSTRAP_BASE_ID=$(file_identity "$BASE")
+        write_owner
+    fi
+    bootstrap_dir_ok || die 'Unsafe bootstrap recovery directory.'
+    plain_root_file "$BASE/owner" && [[ $(stat -c %h -- "$BASE/owner") == 1 && $(cat "$BASE/owner") == "${S[task_id]}" ]] || die 'Unowned or foreign bootstrap data was not adopted.'
+    for file in "$BASE"/* "$BASE"/.[!.]* "$BASE"/..?*; do
+        [[ -e $file || -L $file ]] || continue
+        case $file in "$WORKER"|"$STATE_FILE"|"$BASE/owner"|"$BASE/next-vps-setup.log") plain_root_file "$file" || die 'Unsafe bootstrap recovery file.' ;; *) die 'Unknown bootstrap residual; it was not changed.' ;; esac
+    done
+    if [[ -e $WORKER || -L $WORKER ]]; then
+        plain_root_file "$WORKER" && [[ $(stat -c %h -- "$WORKER") == 1 && $(file_sha "$WORKER") == "${S[worker_sha]}" ]] || die 'Bootstrap worker changed; it was not overwritten.'
+    else save_state; copy_worker "$entry"; fi
+    verify_task_files
+    S[entry_identity]=$(file_identity "$entry"); S[entry_sha]=$(file_sha "$entry"); S[failed]=no
+    save_state; write_state_to "$RESULT"
+    [[ -e $UNIT_FILE || -L $UNIT_FILE ]] || publish_config "$UNIT_FILE" "$(unit_content)"
+    launch_worker
+}
 prepare_cleanup_recovery() {
     local entry=$1 file
     [[ ${S[phase]} == cleanup && ${S[result_status]} == cleanup_pending ]] || die 'Receipt is not a cleanup recovery point.'
     safe_entry_path "$entry" && [[ $(file_sha "$entry") == "${S[worker_sha]}" ]] || die 'Cleanup recovery requires the same root-owned script version.'
     [[ $entry == "${S[entry_path]}" ]] || die 'For cleanup recovery, upload the same script to the original entry path shown in the receipt.'
+    trap 'on_worker_error "$?"' ERR
+    trap 'code=$?; if ((code!=0)); then on_worker_error "$code"; fi' EXIT
+    trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
     if [[ -e $BASE || -L $BASE ]]; then
         [[ -d $BASE && ! -L $BASE && $(stat -c %u "$BASE") == 0 && $(stat -c %a "$BASE") == 700 ]] || die 'Unsafe task directory.'
         for file in "$BASE"/* "$BASE"/.[!.]* "$BASE"/..?*; do
@@ -1411,14 +1658,15 @@ prepare_cleanup_recovery() {
     fi
     # Only an explicit same-version --resume can adopt this freshly uploaded copy.
     S[entry_identity]=$(file_identity "$entry"); S[entry_sha]=$(file_sha "$entry"); S[failed]=no
-    printf '%s\n' "${S[task_id]}" > "$BASE/owner"
-    [[ -e $WORKER ]] || install -m 0700 -- "$entry" "$WORKER"
+    [[ -e $BASE/owner ]] || write_owner
     save_state
+    [[ -e $WORKER ]] || copy_worker "$entry"
     [[ -e $UNIT_FILE ]] || publish_config "$UNIT_FILE" "$(unit_content)"
     launch_worker
 }
 initialize_task() {
     local entry=$1 name port meta owner pkg hash memory
+    meta=$(kernel_meta_for_abi "$(uname -r)") || die 'Unsupported kernel flavour; only Debian 13 stable cloud/standard amd64 kernels are supported.'
     safe_entry_path "$entry" || die 'Upload a root-owned, non-symlink copy under /root, not writable by other users.'
     [[ ! -e $BASE && ! -L $BASE && ! -e $UNIT_FILE && ! -L $UNIT_FILE ]] || die 'Unknown task files exist; no files were overwritten.'
     [[ ! -e $JAIL && ! -L $JAIL && ! -e $BALLOON_CONF && ! -L $BALLOON_CONF ]] || die 'Existing initialization configuration found; this entry is for a fresh system.'
@@ -1431,7 +1679,6 @@ initialize_task() {
     printf '当前实际 SSH 端口（仅核验，不修改）: '; IFS= read -r port
     validate_port "$port" || die 'SSH 端口无效。请输入 1 到 65535 的数字。'
     check_ssh "$port"; check_sources; check_resources
-    case $(uname -r) in *-cloud-amd64) meta=linux-image-cloud-amd64 ;; *-amd64) meta=linux-image-amd64 ;; *) die 'Unrecognized kernel series.' ;; esac
     pkg=linux-image-$(uname -r)
     installed "$pkg" || die 'Running kernel is not owned by the expected Debian kernel package.'
     owner=$(dpkg-query -W -f='${Maintainer}' "$pkg")
@@ -1445,11 +1692,15 @@ initialize_task() {
        [boot_before]=- [last_config_boot]="$(boot_id)" [reboot_count]=0 [reboot_wait]=none [failed]=no
        [entry_path]="$entry" [entry_identity]="$(file_identity "$entry")" [entry_sha]="$hash" [worker_sha]="$hash"
        [ssh_policy_sha]="$(ssh_policy_sha)" [result_status]=running [verified_boot]=- [verified_at]=0 [config_hashes]=- [packages]=- [ntp_status]=pending)
-    mkdir -m 0700 -- "$BASE"
-    printf '%s\n' "${S[task_id]}" > "$BASE/owner"
-    install -m 0700 -- "$entry" "$WORKER"
-    [[ $(file_sha "$WORKER") == "$hash" && $(file_sha "$entry") == "$hash" ]] || die 'Entry changed during preparation.'
-    save_state; write_state_to "$RESULT"
+    trap 'on_worker_error "$?"' ERR
+    trap 'code=$?; if ((code!=0)); then on_worker_error "$code"; fi' EXIT
+    trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
+    write_state_to "$RESULT"
+    mkdir -m 0700 -- "$BASE"; BOOTSTRAP_BASE_ID=$(file_identity "$BASE")
+    write_owner
+    save_state
+    copy_worker "$entry"
+    verify_task_files
     publish_config "$UNIT_FILE" "$(unit_content)"
     launch_worker
 }
@@ -1470,6 +1721,7 @@ main() {
     fi
     if [[ $mode != --worker ]]; then check_os; fi
     # Directory inode is stable; no temporary lock file survives or is unlinked.
+    safe_state_parent /var/lib || die 'Unsafe state parent directory; ownership or permissions require inspection.'
     exec 9</var/lib
     flock -n 9 || die 'Another initialization process is running.'
     if [[ $mode == --worker ]]; then worker_main; return; fi
@@ -1481,6 +1733,7 @@ main() {
         if [[ $mode == --resume ]]; then
             safe_entry_path "$entry" && [[ $entry == "${S[entry_path]}" && $(file_sha "$entry") == "${S[worker_sha]}" ]] || die '恢复任务需要原路径、相同内容的脚本文件。'
             if [[ ${S[phase]} == cleanup ]]; then prepare_cleanup_recovery "$entry"; return 0; fi
+            if bootstrap_pending; then prepare_bootstrap_recovery "$entry"; return 0; fi
             verify_task_files
             S[entry_identity]=$(file_identity "$entry"); S[entry_sha]=$(file_sha "$entry")
             S[failed]=no; save_state
@@ -1494,8 +1747,11 @@ main() {
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'Receipt belongs to another machine.'
         print_status
         if [[ ${S[result_status]} == complete ]]; then printf '%s\n' '这台机器已完成初始化，本次没有重复修改系统。需要更新内核时，请使用内核维护工具。'; return 0; fi
-        if [[ $mode == --resume ]]; then prepare_cleanup_recovery "$entry"; return 0; fi
-        die 'Cleanup was interrupted after its durable receipt. Retain this receipt and inspect remaining task files before cleanup recovery.'
+        if [[ $mode == --resume ]]; then
+            if bootstrap_pending; then prepare_bootstrap_recovery "$entry"; else prepare_cleanup_recovery "$entry"; fi
+            return 0
+        fi
+        die 'Task preparation or cleanup was interrupted. Retain this receipt and use the identical original file with --resume after inspecting the cause.'
     fi
     [[ $mode == start ]] || die 'No existing task or receipt.'
     [[ $0 == /* && ! -L $0 && -f $0 ]] || die 'Use bash followed by an absolute regular file under /root.'

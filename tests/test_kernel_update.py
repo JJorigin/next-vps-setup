@@ -38,7 +38,7 @@ def inventory(*extra: str) -> str:
 
 def valid_state() -> dict[str, str]:
     return {
-        "format": "1", "version": "1.1.1", "task_id": BEFORE,
+        "format": "1", "version": "1.2", "task_id": BEFORE,
         "machine_id": "a" * 32, "phase": "install", "failed": "no",
         "result_status": "running", "meta": META, "meta_version": "-",
         "target_pkg": "-", "target_abi": "-", "target_version": "-",
@@ -619,7 +619,7 @@ resume_task /root/next-vps-kernel-update.sh
         self.assertFalse(self.calls.exists())
         self.assertEqual((self.root / "task/unknown-user-file").read_text(), "do not adopt or delete")
 
-    def test_prepare_publishes_new_running_receipt_before_launch(self) -> None:
+    def prepare_fixture(self) -> tuple[Path, str, str]:
         old = self.cleanup_state()
         old.update({"phase": "done", "result_status": "complete", "task_id": "33333333-3333-4333-8333-333333333333"})
         result_path = self.root / "result.tsv"
@@ -651,11 +651,12 @@ snapshot() {
     S[swappiness]=10
     S[balloon]=module
 }
-install() {
-    [[ $# == 5 && $1 == -m && $2 == 0700 && $3 == -- && $4 == /root/next-vps-kernel-update.sh && $5 == "$WORKER" ]] || return 95
-    /bin/cp -- "$FIXTURE_ROOT/uploaded.sh" "$WORKER"
-    /bin/chmod 0700 -- "$WORKER"
+cp() {
+    [[ $# == 3 && $1 == -- && $2 == /root/next-vps-kernel-update.sh && $3 == "$BASE"/.bootstrap-worker.* ]] || return 95
+    [[ -f $STATE && $(receipt_field "$STATE" task_id) == "${S[task_id]}" ]] || return 96
+    /bin/cp -- "$FIXTURE_ROOT/uploaded.sh" "$3"
 }
+publish_login_notice() { printf 'notice:%s\n' "$1" >> "$CALLS"; }
 launch() {
     [[ $(receipt_field "$RESULT" task_id) == "${S[task_id]}" ]]
     [[ $(receipt_field "$RESULT" phase) == install ]]
@@ -663,8 +664,12 @@ launch() {
     [[ $(receipt_field "$RESULT" failed) == no ]]
     printf 'launch:%s\n' "${S[task_id]}" >> "$CALLS"
 }
-prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
 '''
+        return result_path, new_task, body
+
+    def test_prepare_publishes_new_running_receipt_before_launch(self) -> None:
+        result_path, new_task, body = self.prepare_fixture()
+        body += "\nprepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64\n"
         self.run_bash(body)
         saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
         self.assertEqual(saved["task_id"], new_task)
@@ -673,11 +678,129 @@ prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
         self.assertEqual(saved["failed"], "no")
         self.assertEqual(self.calls.read_text(), f"launch:{new_task}\n")
 
+    def test_prepare_copy_failure_keeps_durable_failure_and_resumes_without_partial_worker(self) -> None:
+        result_path, task_id, body = self.prepare_fixture()
+        proc = self.run_bash(body + r'''
+cp() { printf 'partial worker\n' > "$3"; return 73; }
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        task = self.root / "task"
+        self.assertFalse((task / "worker.sh").exists())
+        self.assertEqual(list(task.glob(".bootstrap-*")), [])
+        for path in (task / "state.tsv", result_path):
+            saved = dict(line.split("\t", 1) for line in path.read_text().splitlines())
+            self.assertEqual(saved["task_id"], task_id)
+            self.assertEqual(saved["phase"], "install")
+            self.assertEqual(saved["failed"], "yes")
+            self.assertEqual(saved["result_status"], "running")
+        self.assertFalse((self.root / "unit.service").exists())
+        self.assertEqual(self.calls.read_text(), "notice:failure\n")
+        self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n")
+        self.assertEqual((task / "worker.sh").read_bytes(), (self.root / "uploaded.sh").read_bytes())
+        saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
+        # The fixture launch checks RESULT; resume must refresh failure before handoff.
+        self.assertEqual(saved["failed"], "no")
+
+    def test_prepare_mkdir_failure_does_not_leave_stale_success_and_can_resume(self) -> None:
+        result_path, task_id, body = self.prepare_fixture()
+        proc = self.run_bash(body + r'''
+mkdir() { return 73; }
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.root / "task").exists())
+        saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
+        self.assertEqual(saved["task_id"], task_id)
+        self.assertEqual(saved["failed"], "yes")
+        self.assertEqual(saved["result_status"], "running")
+        self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n")
+        self.assertTrue((self.root / "task/worker.sh").exists())
+
+    def test_prepare_initial_state_failure_retains_owned_bootstrap_and_can_resume(self) -> None:
+        result_path, _, body = self.prepare_fixture()
+        proc = self.run_bash(body + r'''
+save_state() { return 74; }
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue((self.root / "task/owner").exists())
+        self.assertFalse((self.root / "task/state.tsv").exists())
+        self.assertFalse((self.root / "task/worker.sh").exists())
+        self.assertFalse((self.root / "unit.service").exists())
+        saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
+        self.assertEqual(saved["failed"], "yes")
+        self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n")
+        self.assertTrue((self.root / "task/state.tsv").exists())
+        self.assertTrue((self.root / "task/worker.sh").exists())
+
+    def test_prepare_owner_temp_failure_removes_only_its_empty_bootstrap_directory(self) -> None:
+        _, _, body = self.prepare_fixture()
+        proc = self.run_bash(body + r'''
+mktemp() {
+    [[ $1 != "$BASE"/.bootstrap-owner.* ]] || return 73
+    command mktemp "$@"
+}
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.root / "task").exists())
+        self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n")
+        self.assertTrue((self.root / "task/worker.sh").exists())
+
+    def test_prepare_unit_failure_preserves_identical_worker_for_resume(self) -> None:
+        _, _, body = self.prepare_fixture()
+        proc = self.run_bash(body + r'''
+write_unit() { return 75; }
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        worker = self.root / "task/worker.sh"
+        before = (worker.read_bytes(), worker.stat().st_ino)
+        self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n")
+        self.assertEqual((worker.read_bytes(), worker.stat().st_ino), before)
+
+    def test_bootstrap_resume_rejects_unowned_directory_unknown_file_or_changed_worker(self) -> None:
+        _, _, body = self.prepare_fixture()
+        self.run_bash(body + r'''
+cp() { return 73; }
+prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
+''', check=False)
+        task = self.root / "task"
+        owner = task / "owner"
+        original_owner = owner.read_bytes()
+        state_path = task / "state.tsv"
+        state_before = (state_path.read_bytes(), state_path.stat().st_ino)
+        owner.unlink()
+        proc = self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(owner.exists())
+        self.assertEqual((state_path.read_bytes(), state_path.stat().st_ino), state_before)
+        owner.write_text("33333333-3333-4333-8333-333333333333\n")
+        proc = self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual((state_path.read_bytes(), state_path.stat().st_ino), state_before)
+        self.assertEqual(owner.read_text(), "33333333-3333-4333-8333-333333333333\n")
+        owner.write_bytes(original_owner)
+        unknown = task / "unknown-user-file"
+        unknown.write_text("must remain")
+        proc = self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(unknown.read_text(), "must remain")
+        self.assertFalse((task / "worker.sh").exists())
+        unknown.unlink()
+        worker = task / "worker.sh"
+        worker.write_text("changed worker must remain")
+        proc = self.run_bash(body + "\nresume_task /root/next-vps-kernel-update.sh\n", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(worker.read_text(), "changed worker must remain")
+
     def test_worker_error_replaces_stale_success_receipt_with_current_failure(self) -> None:
         task = self.root / "task"
         task.mkdir(mode=0o700)
         state = self.purge_state()
         (task / "state.tsv").write_text("".join(f"{k}\t{v}\n" for k, v in state.items()), encoding="utf-8")
+        (task / "owner").write_text(state["task_id"] + "\n", encoding="utf-8")
         old = self.cleanup_state()
         old.update({"phase": "done", "result_status": "complete", "task_id": "33333333-3333-4333-8333-333333333333"})
         result_path = self.root / "result.tsv"
@@ -698,6 +821,7 @@ prepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64
         state = self.purge_state()
         state_path = task / "state.tsv"
         state_path.write_text("".join(f"{k}\t{v}\n" for k, v in state.items()), encoding="utf-8")
+        (task / "owner").write_text(state["task_id"] + "\n", encoding="utf-8")
         body = assignments(state) + self.temporary_file_checks() + r'''
 unit_content > "$UNIT_FILE"
 chmod 0600 "$UNIT_FILE"
@@ -748,10 +872,9 @@ sha() {
     if [[ $1 == /root/next-vps-kernel-update.sh ]]; then sha256sum -- "$FIXTURE_ROOT/uploaded.sh" | awk '{print $1}'
     else sha256sum -- "$1" | awk '{print $1}'; fi
 }
-install() {
-    [[ $# == 5 && $1 == -m && $2 == 0700 && $3 == -- && $4 == /root/next-vps-kernel-update.sh && $5 == "$WORKER" ]] || return 95
-    /bin/cp -- "$FIXTURE_ROOT/uploaded.sh" "$WORKER"
-    /bin/chmod 0700 -- "$WORKER"
+cp() {
+    [[ $# == 3 && $1 == -- && $2 == /root/next-vps-kernel-update.sh && $3 == "$BASE"/.bootstrap-worker.* ]] || return 95
+    /bin/cp -- "$FIXTURE_ROOT/uploaded.sh" "$3"
 }
 resume_task /root/next-vps-kernel-update.sh
 '''
