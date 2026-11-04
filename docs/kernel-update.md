@@ -23,7 +23,7 @@ GitHub：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/v1.1/next-vps-kernel-update.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.1/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -34,7 +34,7 @@ jsDelivr：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@v1.1/next-vps-kernel-update.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@fe2fc082435892a4d76fa87f51c0871ff49faf01/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
