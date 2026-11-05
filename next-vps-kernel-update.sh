@@ -1,9 +1,9 @@
 #!/bin/bash
-# next-vps-kernel-update 1.2 -- Debian 13 official-kernel maintenance.
+# next-vps-kernel-update 1.3 -- Debian 13 official-kernel maintenance.
 # Save under /root; run with bash and an absolute path. No network tuning.
 # Functions may be sourced by the isolated test harness; main is not then run.
 
-VERSION=1.2
+VERSION=1.3
 BASE=/var/lib/next-vps-kernel-update
 STATE=$BASE/state.tsv
 WORKER=$BASE/worker.sh
@@ -257,8 +257,7 @@ nv_notice_text() {
     if [[ $kind == success ]]; then
         printf '  如需查看详细记录：\n    cat %s\n' "$result"
     else
-        printf '  下一步：查看失败详情。\n    journalctl -u %s.service -n 80 --no-pager\n' "$NV_NOTICE_APP"
-        printf '  文件日志：%s\n' "$log"
+        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log"
         printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
         printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
     fi
@@ -990,9 +989,14 @@ ssh_listening() {
     listeners=$(ss -H -lntp | awk '/"sshd"/{n=split($4,a,":");print a[n]}' | sort -u) || return 1
     [[ -n $configured && $configured == "$listeners" ]]
 }
-swap_hash() { swapon --show --noheadings --raw --bytes --output NAME,SIZE,PRIO | sort | sha256sum | awk '{print $1}'; }
+swap_hash() {
+    local rows
+    rows=$(swapon --show=NAME,SIZE,PRIO --noheadings --raw --bytes) || return
+    { if [[ -n $rows ]]; then printf '%s\n' "$rows"; fi; } |
+        sort | sha256sum | awk '{print $1}'
+}
 config_hash() {
-    local file
+    local file metadata
     for file in /etc/hostname /etc/localtime /etc/passwd /etc/shadow /etc/group /etc/gshadow \
         /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf /etc/sysctl.conf /etc/sysctl.d/*.conf \
         /etc/modprobe.d/*.conf /etc/fail2ban/jail.d/99-next-vps-setup.local \
@@ -1000,7 +1004,8 @@ config_hash() {
         [[ -e $file || -L $file ]] || continue
         [[ -f $file && -r $file ]] || return 1
         sha256sum --zero -- "$file" || return 1
-        printf '%s\0' "$(stat -c '%u:%g:%a' -- "$file")"
+        metadata=$(stat -c '%u:%g:%a' -- "$file") || return 1
+        printf '%s\0' "$metadata" || return 1
         if [[ -L $file ]]; then readlink -- "$file" || return 1; fi
     done | sha256sum | awk '{print $1}'
 }
@@ -1020,11 +1025,16 @@ snapshot() {
     fi
 }
 verify_preserved() {
-    local services unit ready attempt
-    [[ $(config_hash) == "${S[config_sha]}" ]] || die 'Persistent settings changed; inspect them before deleting old kernels.'
+    local services unit ready attempt current_config current_ssh current_swap current_swappiness
+    current_config=$(config_hash) || die '无法完整读取持久配置，已停止旧内核清理。'
+    [[ $current_config == "${S[config_sha]}" ]] || die 'Persistent settings changed; inspect them before deleting old kernels.'
     /usr/sbin/sshd -t
-    [[ $(ssh_hash) == "${S[ssh_sha]}" ]] || die 'Effective SSH policy changed.'
-    [[ $(swap_hash) == "${S[swap_sha]}" && $(sysctl -n vm.swappiness) == "${S[swappiness]}" ]] || die 'Swap or swappiness did not persist.'
+    current_ssh=$(ssh_hash) || die '无法完整读取 SSH 有效配置，已停止旧内核清理。'
+    [[ $current_ssh == "${S[ssh_sha]}" ]] || die 'Effective SSH policy changed.'
+    current_swap=$(swap_hash) || die '无法读取当前 Swap 状态，已停止旧内核清理。'
+    [[ $current_swap == "${S[swap_sha]}" ]] || die 'Swap 的路径、容量或优先级与更新前不一致，请保留日志核对。'
+    current_swappiness=$(sysctl -n vm.swappiness) || die '无法读取当前 swappiness，已停止旧内核清理。'
+    [[ $current_swappiness == "${S[swappiness]}" ]] || die "swappiness 与更新前不一致：原值 ${S[swappiness]}，当前值 $current_swappiness。"
     IFS=, read -r -a services <<< "${S[services]}"
     for ((attempt=0; attempt<30; attempt++)); do
         ready=yes
@@ -1178,7 +1188,9 @@ install_target() {
     installed "$pkg" && [[ $(dpkg-query -W -f='${Version}' "$pkg") == "$version" ]] || die 'Target package version differs.'
     [[ -s $BOOT_DIR/vmlinuz-$abi && -s $BOOT_DIR/initrd.img-$abi && -r $BOOT_DIR/config-$abi ]] || die 'Target boot files are missing.'
     balloon_mode "$abi" >/dev/null || die 'Target kernel has built-in/unknown balloon support; old kernels were not deleted.'
-    [[ $(config_hash) == "${S[config_sha]}" ]] || die 'Persistent configuration changed during installation; inspect before rebooting.'
+    local current_config
+    current_config=$(config_hash) || die '无法完整读取持久配置，已停止自动重启。'
+    [[ $current_config == "${S[config_sha]}" ]] || die 'Persistent configuration changed during installation; inspect before rebooting.'
     S[phase]=reboot; save_state
 }
 purge_old() {

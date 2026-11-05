@@ -38,7 +38,7 @@ def inventory(*extra: str) -> str:
 
 def valid_state() -> dict[str, str]:
     return {
-        "format": "1", "version": "1.2", "task_id": BEFORE,
+        "format": "1", "version": "1.3", "task_id": BEFORE,
         "machine_id": "a" * 32, "phase": "install", "failed": "no",
         "result_status": "running", "meta": META, "meta_version": "-",
         "target_pkg": "-", "target_abi": "-", "target_version": "-",
@@ -333,6 +333,87 @@ SYS_DIR=$FIXTURE_ROOT/sys
         path.write_text("".join(f"{k}\t{v}\n" for k, v in valid_state().items()), encoding="utf-8")
         self.run_bash('plain_file() { [[ -f $1 && ! -L $1 ]]; }; load_state "$1"; [[ ${S[phase]} == install ]]', str(path))
 
+    def preserved_fixture(self) -> str:
+        """Keep the real SSH hash pipeline, with all system operations substituted."""
+        return r'''
+die() { printf 'VERIFY_ERROR:%s\n' "$*" >&2; exit 42; }
+config_hash() { printf 'fixture-config\n'; }
+function /usr/sbin/sshd {
+    case $1 in
+        -t) return 0 ;;
+        -T) printf 'fixture ssh policy\n' ;;
+        *) return 97 ;;
+    esac
+}
+swap_hash() { printf 'fixture-swap\n'; }
+sysctl() { printf '10\n'; }
+systemctl() { return 0; }
+fail2ban-client() { return 0; }
+ssh_listening() { return 0; }
+balloon_mode() { printf 'absent\n'; }
+SYS_DIR=$FIXTURE_ROOT/sys
+S[config_sha]=fixture-config
+S[ssh_sha]=$(ssh_hash)
+S[swap_sha]=fixture-swap
+S[swappiness]=10
+S[services]=ssh.service,fail2ban.service
+S[target_abi]=fixture-amd64
+'''
+
+    def test_verifier_rejects_matching_ssh_hash_when_sshd_read_failed(self) -> None:
+        body = self.preserved_fixture() + r'''
+function /usr/sbin/sshd {
+    case $1 in
+        -t) return 0 ;;
+        -T) printf 'fixture ssh policy\n'; return 23 ;;
+        *) return 97 ;;
+    esac
+}
+verify_preserved
+printf 'PRESERVED_OK\n'
+'''
+        proc = self.run_bash(body, check=False)
+        self.assertEqual(proc.returncode, 42, proc.stdout + proc.stderr)
+        self.assertIn("无法完整读取 SSH 有效配置", proc.stderr)
+        self.assertNotIn("PRESERVED_OK", proc.stdout)
+
+    def test_verifier_rejects_matching_config_hash_when_read_failed(self) -> None:
+        body = self.preserved_fixture() + r'''
+config_hash() { printf 'fixture-config\n'; return 23; }
+verify_preserved
+printf 'PRESERVED_OK\n'
+'''
+        proc = self.run_bash(body, check=False)
+        self.assertEqual(proc.returncode, 42, proc.stdout + proc.stderr)
+        self.assertIn("无法完整读取持久配置", proc.stderr)
+        self.assertNotIn("PRESERVED_OK", proc.stdout)
+
+    def test_config_hash_rejects_stat_failure_in_conditional_context(self) -> None:
+        fixture = self.root / "etc/hostname"
+        fixture.parent.mkdir()
+        fixture.write_text("fixture-host\n", encoding="utf-8")
+        body = r'''
+# Rebase only the actual helper's fixed input paths; no host configuration is read.
+definition=$(declare -f config_hash)
+definition=${definition//\/etc\//$FIXTURE_ROOT/etc/}
+definition=${definition//\/var\//$FIXTURE_ROOT/var/}
+eval "$definition"
+stat() {
+    [[ $# == 4 && $1 == -c && $2 == '%u:%g:%a' && $3 == -- &&
+       $4 == "$FIXTURE_ROOT/etc/hostname" ]] || return 97
+    printf 'metadata-read-failed\n' >> "$CALLS"
+    return 23
+}
+if produced=$(config_hash); then
+    printf 'UNEXPECTED_METADATA_SUCCESS\n'
+    exit 98
+fi
+printf 'METADATA_FAILURE_REJECTED\n'
+'''
+        proc = self.run_bash(body)
+        self.assertEqual(proc.stdout, "METADATA_FAILURE_REJECTED\n")
+        self.assertEqual(self.calls.read_text(), "metadata-read-failed\n")
+
     def test_purge_verification_failure_never_reaches_apt(self) -> None:
         body = assignments(valid_state()) + r'''
 verify_target() { die 'mock verification failed'; }
@@ -612,6 +693,24 @@ resume_task /root/next-vps-kernel-update.sh
         self.assertFalse(self.calls.exists())
         self.assertEqual(destination.read_bytes(), before)
 
+    def test_resume_rejects_unfinished_12_task_without_changing_its_files(self) -> None:
+        destination, body = self.resume_fixture()
+        destination.write_text(
+            destination.read_text(encoding="utf-8").replace("version\t1.3\n", "version\t1.2\n"),
+            encoding="utf-8", newline="\n",
+        )
+        before = {path.relative_to(self.root): path.read_bytes()
+                  for path in (self.root / "task").iterdir() if path.is_file()}
+        proc = self.run_bash(body + '\nresume_task /root/next-vps-kernel-update.sh\n', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Invalid existing state.", proc.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse((self.root / "result.tsv").exists())
+        self.assertFalse((self.root / "unit.service").exists())
+        after = {path.relative_to(self.root): path.read_bytes()
+                 for path in (self.root / "task").iterdir() if path.is_file()}
+        self.assertEqual(after, before)
+
     def test_cleanup_receipt_resume_rejects_unknown_residual(self) -> None:
         _, body = self.resume_fixture(cleanup_receipt=True, extra_residual=True)
         proc = self.run_bash(body + '\nresume_task /root/next-vps-kernel-update.sh\n', check=False)
@@ -676,6 +775,28 @@ launch() {
         self.assertEqual(saved["result_status"], "running")
         self.assertEqual(saved["phase"], "install")
         self.assertEqual(saved["failed"], "no")
+        self.assertEqual(self.calls.read_text(), f"launch:{new_task}\n")
+
+    def test_prepare_starts_new_13_task_after_completed_12_receipt(self) -> None:
+        result_path, new_task, body = self.prepare_fixture()
+        result_path.write_text(
+            result_path.read_text(encoding="utf-8").replace("version\t1.3\n", "version\t1.2\n"),
+            encoding="utf-8", newline="\n",
+        )
+        old = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
+        self.assertEqual(old["version"], "1.2")
+        self.assertEqual(old["result_status"], "complete")
+        self.run_bash(body + '\nprepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64\n')
+        saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
+        state = dict(line.split("\t", 1) for line in (self.root / "task/state.tsv").read_text().splitlines())
+        self.assertEqual(saved["version"], "1.3")
+        self.assertEqual(saved["task_id"], new_task)
+        self.assertNotEqual(saved["task_id"], old["task_id"])
+        self.assertEqual(saved["phase"], "install")
+        self.assertEqual(saved["result_status"], "running")
+        self.assertEqual(saved["failed"], "no")
+        self.assertEqual(saved, state)
+        self.assertEqual((self.root / "task/worker.sh").read_bytes(), (self.root / "uploaded.sh").read_bytes())
         self.assertEqual(self.calls.read_text(), f"launch:{new_task}\n")
 
     def test_prepare_copy_failure_keeps_durable_failure_and_resumes_without_partial_worker(self) -> None:

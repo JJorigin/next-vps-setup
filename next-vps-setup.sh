@@ -1,5 +1,5 @@
 #!/bin/bash
-# next-vps-setup v1.2 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v1.3 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
@@ -30,7 +30,7 @@ SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
 SWAP_BYTES=1073741824
 SWAP_RESERVE_KIB=1048576
-VERSION=1.2
+VERSION=1.3
 declare -A S=()
 IN_REBOOT=no
 BOOTSTRAP_BASE_ID=
@@ -272,8 +272,7 @@ nv_notice_text() {
     if [[ $kind == success ]]; then
         printf '  如需查看详细记录：\n    cat %s\n' "$result"
     else
-        printf '  下一步：查看失败详情。\n    journalctl -u %s.service -n 80 --no-pager\n' "$NV_NOTICE_APP"
-        printf '  文件日志：%s\n' "$log"
+        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log"
         printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
         printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
     fi
@@ -1020,11 +1019,11 @@ swap_owner_content() {
     printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "$SWAP_BYTES"
 }
 swap_unit_content() {
-    printf '%s\n' '# Managed by next-vps-setup v1.2' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
+    printf '%s\n' '# Managed by next-vps-setup v1.3' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
         '' '[Swap]' "What=$SWAP_FILE" 'Priority=10' 'TimeoutSec=90s' \
         '' '[Install]' 'WantedBy=swap.target'
 }
-swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.2' 'vm.swappiness = 10'; }
+swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.3' 'vm.swappiness = 10'; }
 swap_mount_field() {
     local value
     value=$(findmnt --raw --noheadings --first-only --output "$1" --target /var/lib) || die 'Cannot inspect the Swap filesystem.'
@@ -1197,7 +1196,7 @@ publish_config() {
 }
 jail_content() {
     cat <<'JAIL_HEADER'
-# Managed by next-vps-setup v1.2
+# Managed by next-vps-setup v1.3
 [sshd]
 enabled = true
 JAIL_HEADER
@@ -1212,7 +1211,7 @@ bantime = -1
 action = nftables[type=multiport, name=sshd, port="%(port)s", protocol=tcp, table=f2b-next-vps-setup]
 JAIL_BODY
 }
-balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.2' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
+balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.3' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
 configure_hostname() {
     if [[ $(hostnamectl --static) != "${S[hostname]}" ]]; then hostnamectl set-hostname "${S[hostname]}"; dirty; fi
     if ! getent hosts "${S[hostname]}" >/dev/null; then

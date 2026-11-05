@@ -116,7 +116,7 @@ nv_notice_safe_dir() {
         proc = self.login()
         self.assertIn("状态：失败", proc.stdout)
         self.assertIn("出错阶段：配置系统基础设置", proc.stdout)
-        self.assertIn("journalctl -u next-vps-setup.service -n 80 --no-pager", proc.stdout)
+        self.assertIn("tail -n 100 /var/lib/next-vps-setup/next-vps-setup.log", proc.stdout)
         self.assertIn("bash /root/next-vps-setup.sh --resume", proc.stdout)
         self.assert_notice_gone()
 

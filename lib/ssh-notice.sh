@@ -180,8 +180,7 @@ nv_notice_text() {
     if [[ $kind == success ]]; then
         printf '  如需查看详细记录：\n    cat %s\n' "$result"
     else
-        printf '  下一步：查看失败详情。\n    journalctl -u %s.service -n 80 --no-pager\n' "$NV_NOTICE_APP"
-        printf '  文件日志：%s\n' "$log"
+        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log"
         printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
         printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
     fi
