@@ -202,6 +202,52 @@ prepare_bootstrap_recovery /root/next-vps-setup.sh
         self.resume()
         self.assertTrue(self.state.exists())
 
+    def test_interrupted_state_write_preserves_committed_state_and_resumes(self) -> None:
+        self.initialize("cp() { return 73; }", check=False)
+        stage = self.task / ".state-pending"
+        stage.write_text("incomplete scratch data")
+        stage.chmod(0o600)
+        self.assertEqual(self.read_state(self.state)["task_id"], TASK)
+        self.resume()
+        self.assertFalse(stage.exists())
+        self.assertEqual(self.read_state(self.state)["task_id"], TASK)
+
+    def test_swap_publishes_the_same_inode_after_interruption_before_rename(self) -> None:
+        self.initialize()
+        fixture = r'''
+parse_state "$STATE_FILE"
+SWAP_DIR=$FIXTURE_ROOT/final-swap
+SWAP_BYTES=1073741824
+'''
+        before = self.run_shell(fixture + r'''
+S[mem_kib]=524288; S[swap_policy]=disk1g; S[swap_status]=building
+S[swap_uuid]=33333333-3333-4333-8333-333333333333
+save_state
+mkdir -m 0700 -- "$BASE/swap-staged"
+printf 'format\t1\n' > "$BASE/swap-staged/owner.tsv"
+mv() {
+    if [[ ${!#} == "$SWAP_DIR" ]]; then return 73; fi
+    command mv "$@"
+}
+publish_swap_directory
+''', check=False)
+        self.assertNotEqual(before.returncode, 0)
+        staged = self.task / "swap-staged" / "swapfile"
+        inode = staged.stat().st_ino
+        self.assertEqual(self.read_state(self.state)["swap_identity"], f"{staged.stat().st_dev}:{inode}")
+        self.run_shell(fixture + r'''
+mv() {
+    if [[ ${!#} == "$SWAP_DIR" ]]; then
+        [[ $* == "-T --no-copy --update=none-fail -- $BASE/swap-staged $SWAP_DIR" ]] || return 92
+        [[ ! -e $SWAP_DIR && ! -L $SWAP_DIR ]] || return 93
+        command mv -T -- "$BASE/swap-staged" "$SWAP_DIR"
+    else command mv "$@"; fi
+}
+publish_swap_directory
+''')
+        self.assertFalse(staged.exists())
+        self.assertEqual((self.root / "final-swap" / "swapfile").stat().st_ino, inode)
+
     def test_owner_temporary_failure_removes_only_its_empty_directory(self) -> None:
         proc = self.initialize(r'''
 mktemp() {

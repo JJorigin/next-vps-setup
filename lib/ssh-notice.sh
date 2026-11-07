@@ -1,7 +1,7 @@
 # BEGIN NEXT_VPS_SSH_NOTICE
 # Embedded one-time root SSH login notice. This fragment only defines functions.
 # API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
-# Tests may override the two root directories and helper functions before render.
+# Tests may override the root directories and helper functions before render.
 
 nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
 nv_notice_owner() { printf '0\n'; }
@@ -81,6 +81,7 @@ nv_notice_cleanup_locked() {
     rm -- "$NV_NOTICE_HOOK" || return 1
     sync -f "$NV_NOTICE_PROFILE_DIR" || return 1
 }
+# Frozen renderer input for comparing old hooks as data. V2 hooks never call it.
 nv_notice_consume() (
     # Runs as a subshell when the generated hook is sourced by /etc/profile.
     # Non-root, non-SSH, or non-interactive shells do not read/claim the payload.
@@ -112,24 +113,71 @@ nv_notice_consume() (
     nv_notice_cleanup_locked || nv_notice_warn "通知文件尚未清理完成：$NV_NOTICE_HOOK"
     exit 0
 )
+nv_notice_lock_dir_ok() {
+    local path=$1 mode
+    [[ $path =~ ^/[a-zA-Z0-9_./-]+$ && $path != *'/../'* && $path != */.. ]] || return 1
+    nv_notice_safe_dir "$path" || return 1
+    mode=$(stat -c %a -- "$path") || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 ))
+}
+nv_notice_lock() {
+    nv_notice_lock_dir_ok "$NV_NOTICE_LOCK_DIR" || return 1
+    exec 8<"$NV_NOTICE_LOCK_DIR" || return 1
+    command flock -x "$@" 8
+}
+nv_notice_consume_v2() (
+    nv_notice_is_root || exit 0
+    [[ -n ${SSH_CONNECTION:-} && $- == *i* ]] || exit 0
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+    nv_notice_paths || exit 0
+    nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { nv_notice_warn '通知父目录身份异常'; exit 0; }
+    # Never wait behind a writer during login. A later login can read the notice.
+    nv_notice_lock -n || exit 0
+    [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]] || exit 0
+    [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || exit 0
+    nv_notice_plain "$NV_NOTICE_HOOK" || { nv_notice_warn '通知入口身份异常'; exit 0; }
+    nv_notice_terminal || exit 0
+    if [[ -e $NV_NOTICE_DIR || -L $NV_NOTICE_DIR ]]; then
+        nv_notice_validate_dir || { nv_notice_warn '通知内容或目录已变化，已拒绝显示和删除'; exit 0; }
+        if [[ -e $NV_NOTICE_PENDING ]]; then
+            mv -T -- "$NV_NOTICE_PENDING" "$NV_NOTICE_CLAIMED" || { nv_notice_warn '无法标记本次通知'; exit 0; }
+            sync -f "$NV_NOTICE_DIR" || { nv_notice_warn '通知标记未能持久保存'; exit 0; }
+            cat -- "$NV_NOTICE_CLAIMED" || { nv_notice_warn '通知输出未完成'; exit 0; }
+        fi
+    fi
+    nv_notice_cleanup_locked || nv_notice_warn "通知文件尚未清理完成：$NV_NOTICE_HOOK"
+    exit 0
+)
 nv_notice_render_hook() {
-    printf '# next-vps-ssh-notice 1\n'
+    local format=${1:-2}
+    local -a shared=(nv_notice_is_root nv_notice_owner nv_notice_id nv_notice_sha nv_notice_warn nv_notice_plain
+        nv_notice_safe_dir nv_notice_paths nv_notice_terminal nv_notice_validate_dir nv_notice_cleanup_locked)
+    printf '# next-vps-ssh-notice %s\n' "$format" || return 1
     printf '# app\t%s\n# task\t%s\n# generation\t%s\n# directory_id\t%s\n# text_id\t%s\n# text_sha\t%s\n# hook_id\t%s\n# kind\t%s\n' \
-        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND"
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" || return 1
     # /etc/profile.d is shared with POSIX login shells. This complete POSIX
     # command returns before a non-Bash shell reads any Bash-specific grammar.
-    printf '[ -n "${BASH_VERSION:-}" ] || return 0\n'
-    printf '(\n'
+    printf '[ -n "${BASH_VERSION:-}" ] || return 0\n(\n' || return 1
     printf 'NV_NOTICE_APP=%q\nNV_NOTICE_TASK=%q\nNV_NOTICE_GENERATION=%q\nNV_NOTICE_DIR_ID=%q\nNV_NOTICE_TEXT_ID=%q\nNV_NOTICE_TEXT_SHA=%q\nNV_NOTICE_HOOK_ID=%q\nNV_NOTICE_KIND=%q\nNV_NOTICE_PROFILE_DIR=%q\nNV_NOTICE_DATA_ROOT=%q\n' \
-        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" "$NV_NOTICE_PROFILE_DIR" "$NV_NOTICE_DATA_ROOT"
-    declare -f nv_notice_is_root nv_notice_owner nv_notice_id nv_notice_sha nv_notice_warn nv_notice_plain nv_notice_safe_dir nv_notice_paths nv_notice_terminal nv_notice_validate_dir nv_notice_cleanup_locked nv_notice_consume
-    printf 'nv_notice_consume\n)\n'
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" "$NV_NOTICE_PROFILE_DIR" "$NV_NOTICE_DATA_ROOT" || return 1
+    if [[ $format == 1 ]]; then
+        declare -f "${shared[@]}" nv_notice_consume || return 1
+        printf 'nv_notice_consume\n)\n'
+    else
+        printf 'NV_NOTICE_LOCK_DIR=%q\n' "$NV_NOTICE_LOCK_DIR" || return 1
+        declare -f "${shared[@]}" nv_notice_lock_dir_ok nv_notice_lock nv_notice_consume_v2 || return 1
+        printf 'nv_notice_consume_v2\n)\n'
+    fi
 }
 nv_notice_load_existing() {
-    local first key value extra expected line n=0
+    local first key value extra format n=0
     nv_notice_plain "$NV_NOTICE_HOOK" || return 1
-    IFS= read -r first < "$NV_NOTICE_HOOK"
-    [[ $first == '# next-vps-ssh-notice 1' ]] || return 1
+    IFS= read -r first < "$NV_NOTICE_HOOK" || return 1
+    case $first in
+        '# next-vps-ssh-notice 1') format=1 ;;
+        '# next-vps-ssh-notice 2') format=2 ;;
+        *) return 1 ;;
+    esac
     while IFS=$'\t' read -r key value extra; do
         n=$((n+1)); [[ $n != 1 ]] || continue
         ((n<=9)) || break
@@ -148,7 +196,7 @@ nv_notice_load_existing() {
     done < "$NV_NOTICE_HOOK"
     ((n>=9)) && [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || return 1
     # Compare static source as data; do not source an earlier hook to inspect it.
-    cmp -s "$NV_NOTICE_HOOK" <(nv_notice_render_hook) || return 1
+    cmp -s "$NV_NOTICE_HOOK" <(nv_notice_render_hook "$format") || return 1
     [[ ! -e $NV_NOTICE_DIR && ! -L $NV_NOTICE_DIR ]] || nv_notice_validate_dir
 }
 nv_notice_stage_name() {
@@ -166,23 +214,24 @@ nv_notice_text() {
     result=/var/lib/$NV_NOTICE_APP-result.tsv
     if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
     else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
-    printf '\n╭──────────────────────────────────────────────╮\n'
+    printf '\n╭──────────────────────────────────────────────╮\n' || return 1
     if [[ $kind == success ]]; then
-        printf '  ✓ %s已完成\n' "$title"
-        printf '  状态：成功；必需步骤和最终核查已通过，可继续使用服务器。\n'
+        printf '  ✓ %s已完成\n' "$title" || return 1
+        printf '  状态：成功；必需步骤和最终核查已通过，可继续使用服务器。\n' || return 1
     else
-        printf '  ✗ %s已停止\n' "$title"
-        printf '  状态：失败，任务未完成，请先查看原因。\n  出错阶段：%s\n' "$(nv_notice_stage_name "$stage")"
+        printf '  ✗ %s已停止\n' "$title" || return 1
+        printf '  状态：失败，任务未完成，请先查看原因。\n  出错阶段：%s\n' "$(nv_notice_stage_name "$stage")" || return 1
     fi
     if [[ $ntp == unsynchronized || $ntp == unavailable ]]; then
-        printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n'
+        printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n' || return 1
     fi
     if [[ $kind == success ]]; then
-        printf '  如需查看详细记录：\n    cat %s\n' "$result"
+        printf '  如需查看详细记录：\n    cat %s\n' "$result" || return 1
     else
-        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log"
-        printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
-        printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
+        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log" || return 1
+        printf '  文件日志缺失时可查看服务启动记录。\n    journalctl -u %s.service -n 100 --no-pager\n' "$NV_NOTICE_APP" || return 1
+        printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry" || return 1
+        printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n' || return 1
     fi
     printf '  此为一次性通知；读取后自动清理通知文件。\n╰──────────────────────────────────────────────╯\n\n'
 }
@@ -191,18 +240,23 @@ nv_notice_install() (
     export LC_ALL=C
     umask 077
     local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
-    local temp_dir= temp_hook= published_dir=no published_hook=no code
+    local temp_dir= temp_hook= published_dir=no published_hook=no code first
     (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
     NV_NOTICE_APP=$1
     NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
     NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
+    NV_NOTICE_LOCK_DIR=${NV_NOTICE_LOCK_DIR:-/root}
     nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
     [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
     [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
     [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
     nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
-    exec 8<"$NV_NOTICE_PROFILE_DIR" || exit 1
-    flock -x 8 || exit 1
+    nv_notice_lock -w 5 || { printf 'NOTICE_ERROR: 无法获取 root 通知锁\n' >&2; exit 1; }
+    # Coordinate with an old hook reader only while replacing a V1 hook.
+    if nv_notice_plain "$NV_NOTICE_HOOK" && IFS= read -r first < "$NV_NOTICE_HOOK" && [[ $first == '# next-vps-ssh-notice 1' ]]; then
+        exec 7<"$NV_NOTICE_PROFILE_DIR" || exit 1
+        command flock -x -w 5 7 || { printf 'NOTICE_ERROR: 旧版通知仍被占用，已保留\n' >&2; exit 1; }
+    fi
     if [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]]; then
         nv_notice_load_existing && nv_notice_cleanup_locked || { printf 'NOTICE_ERROR: existing notice identity differs; not overwritten\n' >&2; exit 1; }
     fi

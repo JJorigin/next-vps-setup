@@ -1,15 +1,14 @@
 #!/bin/bash
-# next-vps-kernel-update 1.3 -- Debian 13 official-kernel maintenance.
+# next-vps-kernel-update 1.4 -- Debian 13 official-kernel maintenance.
 # Save under /root; run with bash and an absolute path. No network tuning.
 # Functions may be sourced by the isolated test harness; main is not then run.
 
-VERSION=1.3
+VERSION=1.4
 BASE=/var/lib/next-vps-kernel-update
 STATE=$BASE/state.tsv
 WORKER=$BASE/worker.sh
 LOG=$BASE/run.log
 RESULT=/var/lib/next-vps-kernel-update-result.tsv
-PURGE_MANIFEST=$BASE/purge.tsv
 UNIT=next-vps-kernel-update.service
 UNIT_FILE=/etc/systemd/system/next-vps-kernel-update.service
 INIT_RESULT=/var/lib/next-vps-setup-result.tsv
@@ -60,7 +59,7 @@ nv_ui_launch() {
         "  首次断线后，可先等待约 $minutes 分钟再连接。" \
         '  下载或启动较慢时会更久，请勿仅凭等待时间判断完成。' \
         '' \
-        '  成功或失败后，下一次 root 交互式 SSH 登录会显示结果。' \
+        '  成功或失败后，通过 SSH 直接登录 root（登录 Shell 为 Bash）会显示结果。' \
         '  此提示显示一次后自动清理；任务仍在执行时不会报成功。' \
         '' \
         '  如未看到登录提示，查看任务结果：' "    cat $receipt" \
@@ -69,7 +68,7 @@ nv_ui_launch() {
 }
 nv_ui_stopped() {
     nv_ui_heading '操作已停止 · 本次任务尚未完成'
-    printf '%s\n' '请保留下面的原因和任务日志，处理后再使用同一文件恢复。'
+    printf '%s\n' '请保留下方原因。若已有任务记录，请同时保留原脚本和日志，处理后再恢复。'
     printf '原因：%s\n' "$*"
 }
 # END EMBEDDED user-interface
@@ -78,7 +77,7 @@ nv_ui_stopped() {
 # BEGIN NEXT_VPS_SSH_NOTICE
 # Embedded one-time root SSH login notice. This fragment only defines functions.
 # API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
-# Tests may override the two root directories and helper functions before render.
+# Tests may override the root directories and helper functions before render.
 
 nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
 nv_notice_owner() { printf '0\n'; }
@@ -158,6 +157,7 @@ nv_notice_cleanup_locked() {
     rm -- "$NV_NOTICE_HOOK" || return 1
     sync -f "$NV_NOTICE_PROFILE_DIR" || return 1
 }
+# Frozen renderer input for comparing old hooks as data. V2 hooks never call it.
 nv_notice_consume() (
     # Runs as a subshell when the generated hook is sourced by /etc/profile.
     # Non-root, non-SSH, or non-interactive shells do not read/claim the payload.
@@ -189,24 +189,71 @@ nv_notice_consume() (
     nv_notice_cleanup_locked || nv_notice_warn "通知文件尚未清理完成：$NV_NOTICE_HOOK"
     exit 0
 )
+nv_notice_lock_dir_ok() {
+    local path=$1 mode
+    [[ $path =~ ^/[a-zA-Z0-9_./-]+$ && $path != *'/../'* && $path != */.. ]] || return 1
+    nv_notice_safe_dir "$path" || return 1
+    mode=$(stat -c %a -- "$path") || return 1
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 077) == 0 ))
+}
+nv_notice_lock() {
+    nv_notice_lock_dir_ok "$NV_NOTICE_LOCK_DIR" || return 1
+    exec 8<"$NV_NOTICE_LOCK_DIR" || return 1
+    command flock -x "$@" 8
+}
+nv_notice_consume_v2() (
+    nv_notice_is_root || exit 0
+    [[ -n ${SSH_CONNECTION:-} && $- == *i* ]] || exit 0
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+    nv_notice_paths || exit 0
+    nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { nv_notice_warn '通知父目录身份异常'; exit 0; }
+    # Never wait behind a writer during login. A later login can read the notice.
+    nv_notice_lock -n || exit 0
+    [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]] || exit 0
+    [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || exit 0
+    nv_notice_plain "$NV_NOTICE_HOOK" || { nv_notice_warn '通知入口身份异常'; exit 0; }
+    nv_notice_terminal || exit 0
+    if [[ -e $NV_NOTICE_DIR || -L $NV_NOTICE_DIR ]]; then
+        nv_notice_validate_dir || { nv_notice_warn '通知内容或目录已变化，已拒绝显示和删除'; exit 0; }
+        if [[ -e $NV_NOTICE_PENDING ]]; then
+            mv -T -- "$NV_NOTICE_PENDING" "$NV_NOTICE_CLAIMED" || { nv_notice_warn '无法标记本次通知'; exit 0; }
+            sync -f "$NV_NOTICE_DIR" || { nv_notice_warn '通知标记未能持久保存'; exit 0; }
+            cat -- "$NV_NOTICE_CLAIMED" || { nv_notice_warn '通知输出未完成'; exit 0; }
+        fi
+    fi
+    nv_notice_cleanup_locked || nv_notice_warn "通知文件尚未清理完成：$NV_NOTICE_HOOK"
+    exit 0
+)
 nv_notice_render_hook() {
-    printf '# next-vps-ssh-notice 1\n'
+    local format=${1:-2}
+    local -a shared=(nv_notice_is_root nv_notice_owner nv_notice_id nv_notice_sha nv_notice_warn nv_notice_plain
+        nv_notice_safe_dir nv_notice_paths nv_notice_terminal nv_notice_validate_dir nv_notice_cleanup_locked)
+    printf '# next-vps-ssh-notice %s\n' "$format" || return 1
     printf '# app\t%s\n# task\t%s\n# generation\t%s\n# directory_id\t%s\n# text_id\t%s\n# text_sha\t%s\n# hook_id\t%s\n# kind\t%s\n' \
-        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND"
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" || return 1
     # /etc/profile.d is shared with POSIX login shells. This complete POSIX
     # command returns before a non-Bash shell reads any Bash-specific grammar.
-    printf '[ -n "${BASH_VERSION:-}" ] || return 0\n'
-    printf '(\n'
+    printf '[ -n "${BASH_VERSION:-}" ] || return 0\n(\n' || return 1
     printf 'NV_NOTICE_APP=%q\nNV_NOTICE_TASK=%q\nNV_NOTICE_GENERATION=%q\nNV_NOTICE_DIR_ID=%q\nNV_NOTICE_TEXT_ID=%q\nNV_NOTICE_TEXT_SHA=%q\nNV_NOTICE_HOOK_ID=%q\nNV_NOTICE_KIND=%q\nNV_NOTICE_PROFILE_DIR=%q\nNV_NOTICE_DATA_ROOT=%q\n' \
-        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" "$NV_NOTICE_PROFILE_DIR" "$NV_NOTICE_DATA_ROOT"
-    declare -f nv_notice_is_root nv_notice_owner nv_notice_id nv_notice_sha nv_notice_warn nv_notice_plain nv_notice_safe_dir nv_notice_paths nv_notice_terminal nv_notice_validate_dir nv_notice_cleanup_locked nv_notice_consume
-    printf 'nv_notice_consume\n)\n'
+        "$NV_NOTICE_APP" "$NV_NOTICE_TASK" "$NV_NOTICE_GENERATION" "$NV_NOTICE_DIR_ID" "$NV_NOTICE_TEXT_ID" "$NV_NOTICE_TEXT_SHA" "$NV_NOTICE_HOOK_ID" "$NV_NOTICE_KIND" "$NV_NOTICE_PROFILE_DIR" "$NV_NOTICE_DATA_ROOT" || return 1
+    if [[ $format == 1 ]]; then
+        declare -f "${shared[@]}" nv_notice_consume || return 1
+        printf 'nv_notice_consume\n)\n'
+    else
+        printf 'NV_NOTICE_LOCK_DIR=%q\n' "$NV_NOTICE_LOCK_DIR" || return 1
+        declare -f "${shared[@]}" nv_notice_lock_dir_ok nv_notice_lock nv_notice_consume_v2 || return 1
+        printf 'nv_notice_consume_v2\n)\n'
+    fi
 }
 nv_notice_load_existing() {
-    local first key value extra expected line n=0
+    local first key value extra format n=0
     nv_notice_plain "$NV_NOTICE_HOOK" || return 1
-    IFS= read -r first < "$NV_NOTICE_HOOK"
-    [[ $first == '# next-vps-ssh-notice 1' ]] || return 1
+    IFS= read -r first < "$NV_NOTICE_HOOK" || return 1
+    case $first in
+        '# next-vps-ssh-notice 1') format=1 ;;
+        '# next-vps-ssh-notice 2') format=2 ;;
+        *) return 1 ;;
+    esac
     while IFS=$'\t' read -r key value extra; do
         n=$((n+1)); [[ $n != 1 ]] || continue
         ((n<=9)) || break
@@ -225,7 +272,7 @@ nv_notice_load_existing() {
     done < "$NV_NOTICE_HOOK"
     ((n>=9)) && [[ $(nv_notice_id "$NV_NOTICE_HOOK") == "$NV_NOTICE_HOOK_ID" ]] || return 1
     # Compare static source as data; do not source an earlier hook to inspect it.
-    cmp -s "$NV_NOTICE_HOOK" <(nv_notice_render_hook) || return 1
+    cmp -s "$NV_NOTICE_HOOK" <(nv_notice_render_hook "$format") || return 1
     [[ ! -e $NV_NOTICE_DIR && ! -L $NV_NOTICE_DIR ]] || nv_notice_validate_dir
 }
 nv_notice_stage_name() {
@@ -243,23 +290,24 @@ nv_notice_text() {
     result=/var/lib/$NV_NOTICE_APP-result.tsv
     if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
     else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
-    printf '\n╭──────────────────────────────────────────────╮\n'
+    printf '\n╭──────────────────────────────────────────────╮\n' || return 1
     if [[ $kind == success ]]; then
-        printf '  ✓ %s已完成\n' "$title"
-        printf '  状态：成功；必需步骤和最终核查已通过，可继续使用服务器。\n'
+        printf '  ✓ %s已完成\n' "$title" || return 1
+        printf '  状态：成功；必需步骤和最终核查已通过，可继续使用服务器。\n' || return 1
     else
-        printf '  ✗ %s已停止\n' "$title"
-        printf '  状态：失败，任务未完成，请先查看原因。\n  出错阶段：%s\n' "$(nv_notice_stage_name "$stage")"
+        printf '  ✗ %s已停止\n' "$title" || return 1
+        printf '  状态：失败，任务未完成，请先查看原因。\n  出错阶段：%s\n' "$(nv_notice_stage_name "$stage")" || return 1
     fi
     if [[ $ntp == unsynchronized || $ntp == unavailable ]]; then
-        printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n'
+        printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n' || return 1
     fi
     if [[ $kind == success ]]; then
-        printf '  如需查看详细记录：\n    cat %s\n' "$result"
+        printf '  如需查看详细记录：\n    cat %s\n' "$result" || return 1
     else
-        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log"
-        printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry"
-        printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n'
+        printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log" || return 1
+        printf '  文件日志缺失时可查看服务启动记录。\n    journalctl -u %s.service -n 100 --no-pager\n' "$NV_NOTICE_APP" || return 1
+        printf '  修复原因后，使用同版本文件恢复：\n    bash %s --resume\n' "$entry" || return 1
+        printf '  如入口已被清理，先上传同版本脚本到上述原路径。\n' || return 1
     fi
     printf '  此为一次性通知；读取后自动清理通知文件。\n╰──────────────────────────────────────────────╯\n\n'
 }
@@ -268,18 +316,23 @@ nv_notice_install() (
     export LC_ALL=C
     umask 077
     local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
-    local temp_dir= temp_hook= published_dir=no published_hook=no code
+    local temp_dir= temp_hook= published_dir=no published_hook=no code first
     (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
     NV_NOTICE_APP=$1
     NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
     NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
+    NV_NOTICE_LOCK_DIR=${NV_NOTICE_LOCK_DIR:-/root}
     nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
     [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
     [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
     [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
     nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
-    exec 8<"$NV_NOTICE_PROFILE_DIR" || exit 1
-    flock -x 8 || exit 1
+    nv_notice_lock -w 5 || { printf 'NOTICE_ERROR: 无法获取 root 通知锁\n' >&2; exit 1; }
+    # Coordinate with an old hook reader only while replacing a V1 hook.
+    if nv_notice_plain "$NV_NOTICE_HOOK" && IFS= read -r first < "$NV_NOTICE_HOOK" && [[ $first == '# next-vps-ssh-notice 1' ]]; then
+        exec 7<"$NV_NOTICE_PROFILE_DIR" || exit 1
+        command flock -x -w 5 7 || { printf 'NOTICE_ERROR: 旧版通知仍被占用，已保留\n' >&2; exit 1; }
+    fi
     if [[ -e $NV_NOTICE_HOOK || -L $NV_NOTICE_HOOK ]]; then
         nv_notice_load_existing && nv_notice_cleanup_locked || { printf 'NOTICE_ERROR: existing notice identity differs; not overwritten\n' >&2; exit 1; }
     fi
@@ -319,7 +372,7 @@ nv_notice_install() (
 die() { nv_ui_stopped "$*" >&2; exit 1; }
 note() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 publish_login_notice() {
-    nv_notice_install next-vps-kernel-update "$1" "${S[task_id]}" "${S[phase]}" not-recorded "${S[entry]}"
+    NV_NOTICE_LOCK_DIR=/root nv_notice_install next-vps-kernel-update "$1" "${S[task_id]}" "${S[phase]}" not-recorded "${S[entry]}"
 }
 sha() { sha256sum -- "$1" | awk '{print $1}'; }
 identity() { stat -c '%d:%i' -- "$1"; }
@@ -366,10 +419,15 @@ inventory() { dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Version}\t${M
 # Reject mixed/custom/newer images; include both installed and config-only old
 # images, so an earlier manual `remove` does not leave package configuration.
 select_old() {
-    local meta=$1 target=$2 wanted=$3 data=$4 status pkg version maintainer abi target_seen=no meta_seen=no
+    local meta=$1 target=$2 wanted=$3 data=$4 versions=${5:-no}
+    local status pkg version maintainer abi target_seen=no meta_seen=no
     version_ok "$wanted" || return 1
     while IFS=$'\t' read -r status pkg version maintainer; do
-        [[ $status == installed || $status == config-files ]] || continue
+        case $status in
+            installed|config-files) ;;
+            not-installed|'') continue ;;
+            *) return 1 ;;
+        esac
         if [[ $pkg == "$meta" ]]; then [[ $status == installed ]] || return 1; meta_seen=yes; continue; fi
         [[ $pkg != linux-image-amd64 && $pkg != linux-image-cloud-amd64 ]] || return 1
         [[ $pkg == linux-image-* && $maintainer == *'Debian Kernel Team'* ]] || return 1
@@ -379,10 +437,40 @@ select_old() {
             target_seen=yes
         else
             dpkg --compare-versions "$version" lt "$wanted" || return 1
-            printf '%s\n' "$pkg"
+            if [[ $versions == yes ]]; then printf '%s=%s\n' "$pkg" "$version"
+            else printf '%s\n' "$pkg"; fi
         fi
     done <<< "$data"
     [[ $target_seen == yes && $meta_seen == yes ]]
+}
+purge_plan_digest() { printf '%s\n' "$1" | sha256sum | awk '{print $1}'; }
+purge_plan_names() {
+    local entry names=
+    local -a entries=()
+    IFS=, read -r -a entries <<< "$1" || return 1
+    for entry in "${entries[@]}"; do names+=${names:+,}${entry%%=*}; done
+    printf '%s\n' "$names"
+}
+purge_plan_remaining() {
+    local candidates=$1 plan=$2 entry pkg version
+    local -a entries=()
+    local -A approved=() seen=()
+    [[ $plan != - ]] || return 1
+    IFS=, read -r -a entries <<< "$plan" || return 1
+    for entry in "${entries[@]}"; do
+        pkg=${entry%%=*}; version=${entry#*=}
+        [[ $pkg == linux-image-* && $pkg != "${S[target_pkg]}" ]] &&
+            abi_ok "${S[meta]}" "${pkg#linux-image-}" && version_ok "$version" &&
+            dpkg --compare-versions "$version" lt "${S[target_version]}" || return 1
+        [[ ! -v approved[$pkg] ]] || return 1
+        approved[$pkg]=$version
+    done
+    [[ -n $candidates ]] || return 0
+    while IFS== read -r pkg version; do
+        [[ -n $pkg && ${approved[$pkg]:-} == "$version" && ! -v seen[$pkg] ]] || return 1
+        seen[$pkg]=1
+        printf '%s\t%s\n' "$pkg" "$version"
+    done <<< "$candidates"
 }
 validate_purge_plan() {
     local plan=$1 expected=$2 op pkg rest n=0
@@ -434,39 +522,36 @@ apt_guard() {
     [[ ${S[machine_id]} == "$(cat /etc/machine-id)" && $(sha "$WORKER") == "${S[script_sha]}" ]] || die 'APT guard identity mismatch.'
     boot_ready "${S[boot_before]}" "$(boot_id)" "${S[target_abi]}" "$(uname -r)" || die 'APT guard cannot verify the new boot.'
     plain_file "$BOOT_DIR/vmlinuz-${S[target_abi]}" && nv_kernel_image_matches "$BOOT_DIR/vmlinuz-${S[target_abi]}" "$(uname -r)" "$(uname -v)" || die 'APT guard cannot confirm the running target kernel build.'
-    local parsed expected_target
+    local parsed expected_target installed_meta installed_target dependency inv candidates expected
     installed "${S[meta]}" && installed "${S[target_pkg]}" || die 'APT guard cannot find the installed target and metapackage.'
-    [[ $(dpkg-query -W -f='${Version}' "${S[meta]}") == "${S[meta_version]}" &&
-       $(dpkg-query -W -f='${Version}' "${S[target_pkg]}") == "${S[target_version]}" ]] || die 'Target package versions changed before the actual transaction.'
-    parsed=$(parse_dependency "${S[meta]}" "$(dpkg-query -W -f='${Depends}' "${S[meta]}")") || die 'Invalid in-transaction target dependency.'
+    installed_meta=$(dpkg-query -W -f='${Version}' "${S[meta]}") || die 'Cannot read the in-transaction metapackage version.'
+    installed_target=$(dpkg-query -W -f='${Version}' "${S[target_pkg]}") || die 'Cannot read the in-transaction target version.'
+    [[ $installed_meta == "${S[meta_version]}" && $installed_target == "${S[target_version]}" ]] || die 'Target package versions changed before the actual transaction.'
+    dependency=$(dpkg-query -W -f='${Depends}' "${S[meta]}") || die 'Cannot read the in-transaction target dependency.'
+    parsed=$(parse_dependency "${S[meta]}" "$dependency") || die 'Invalid in-transaction target dependency.'
     expected_target=$(printf '%s\t%s\t%s' "${S[target_pkg]}" "${S[target_abi]}" "${S[target_version]}")
     [[ $parsed == "$expected_target" ]] || die 'Target dependency changed before the actual transaction.'
-    plain_file "$PURGE_MANIFEST" && [[ ${S[purge_sha]} != - && $(sha "$PURGE_MANIFEST") == "${S[purge_sha]}" ]] || die 'Approved purge manifest changed.'
-    local pkg version expected; expected=$(cat "$PURGE_MANIFEST")
-    while IFS=$'\t' read -r pkg version; do
-        [[ $pkg != "${S[target_pkg]}" && $pkg != "linux-image-$(uname -r)" ]] || die 'APT guard refuses the running/target kernel.'
-        abi_ok "${S[meta]}" "${pkg#linux-image-}" && version_ok "$version" &&
-            dpkg --compare-versions "$version" lt "${S[target_version]}" || die 'APT guard refuses a non-older or unknown kernel.'
-        [[ $(dpkg-query -W -f='${Version}' "$pkg") == "$version" &&
-           $(dpkg-query -W -f='${Maintainer}' "$pkg") == *'Debian Kernel Team'* ]] || die 'Approved old package identity changed.'
-    done <<< "$expected"
+    # Re-read the entire inventory while APT owns the transaction locks.
+    inv=$(inventory) || die 'Cannot read the in-transaction kernel inventory.'
+    candidates=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$inv" yes) || die 'Kernel inventory changed before the actual transaction.'
+    expected=$(purge_plan_remaining "$candidates" "${S[purge_plan]}") || die 'Old packages differ from the durable purge plan.'
     validate_purge_protocol "$expected" || die 'Actual APT transaction differs from the approved old-kernel purge.'
 }
 boot_ready() { uuid_ok "$1" && uuid_ok "$2" && [[ $1 != "$2" && $3 == "$4" ]]; }
 
 state_keys() {
-    printf '%s\n' format version task_id machine_id phase failed result_status meta meta_version target_pkg target_abi target_version boot_before verified_boot reboots entry entry_id script_sha config_sha ssh_sha swap_sha swappiness services balloon removed verified_at purge_sha
+    printf '%s\n' format version task_id machine_id phase failed result_status meta meta_version target_pkg target_abi target_version boot_before verified_boot reboots reboot_retry entry entry_id script_sha config_sha ssh_sha swap_sha swappiness services balloon removed verified_at purge_sha purge_plan
 }
 value_ok() {
     local key=$1 v=$2
     [[ -n $v && $v != *[[:cntrl:]]* ]] || return 1
     case $key in
-        format) [[ $v == 1 ]] ;; version) [[ $v == "$VERSION" ]] ;;
+        format) [[ $v == 2 ]] ;; version) [[ $v == "$VERSION" ]] ;;
         task_id|boot_before) uuid_ok "$v" ;;
         verified_boot) [[ $v == - ]] || uuid_ok "$v" ;;
         machine_id) [[ $v =~ ^[a-f0-9]{32}$ ]] ;;
         phase) [[ $v == install || $v == reboot || $v == verify || $v == purge || $v == cleanup || $v == done ]] ;;
-        failed) [[ $v == yes || $v == no ]] ;;
+        failed|reboot_retry) [[ $v == yes || $v == no ]] ;;
         result_status) [[ $v == running || $v == cleanup_pending || $v == complete ]] ;;
         meta) [[ $v == linux-image-cloud-amd64 || $v == linux-image-amd64 ]] ;;
         meta_version|target_version) [[ $v == - ]] || version_ok "$v" ;;
@@ -477,6 +562,7 @@ value_ok() {
         entry_id) [[ $v =~ ^[0-9]+:[0-9]+$ ]] ;;
         script_sha|config_sha|ssh_sha|swap_sha) [[ $v =~ ^[a-f0-9]{64}$ ]] ;;
         purge_sha) [[ $v == - || $v =~ ^[a-f0-9]{64}$ ]] ;;
+        purge_plan) [[ $v == - || $v =~ ^linux-image-[0-9][a-z0-9.+-]*-amd64=[0-9][a-zA-Z0-9.+:~_-]*(,linux-image-[0-9][a-z0-9.+-]*-amd64=[0-9][a-zA-Z0-9.+:~_-]*)*$ ]] ;;
         swappiness) [[ $v =~ ^[0-9]{1,3}$ ]] && ((10#$v<=200)) ;;
         services) [[ $v == ssh.service,fail2ban.service || $v == ssh.service,fail2ban.service,x-ui.service ]] ;;
         balloon) [[ $v == module || $v == absent ]] ;;
@@ -486,7 +572,7 @@ value_ok() {
     esac
 }
 validate_state() {
-    local key count=0
+    local key count=0 plan_sha removed
     while IFS= read -r key; do
         [[ -v S[$key] ]] && value_ok "$key" "${S[$key]}" || return 1
         count=$((count+1))
@@ -506,6 +592,20 @@ validate_state() {
         cleanup) [[ ${S[result_status]} == cleanup_pending ]] || return 1 ;;
         done) [[ ${S[result_status]} == complete ]] || return 1 ;;
     esac
+    [[ ${S[reboot_retry]} == no || ( ${S[phase]} == reboot && ${S[reboots]} == 1 ) ]] || return 1
+    if [[ ${S[purge_plan]} == - ]]; then
+        [[ ${S[purge_sha]} == - && ${S[removed]} == - ]] || return 1
+    else
+        [[ ${S[phase]} == purge || ${S[phase]} == cleanup || ${S[phase]} == done ]] || return 1
+        plan_sha=$(purge_plan_digest "${S[purge_plan]}") || return 1
+        [[ $plan_sha == "${S[purge_sha]}" ]] || return 1
+        if [[ ${S[phase]} == purge ]]; then
+            [[ ${S[removed]} == - ]] || return 1
+        else
+            removed=$(purge_plan_names "${S[purge_plan]}") || return 1
+            [[ ${S[removed]} == "$removed" ]] || return 1
+        fi
+    fi
     if [[ ${S[result_status]} != running ]]; then
         [[ ${S[phase]} == cleanup || ${S[phase]} == done ]] || return 1
         [[ ${S[verified_boot]} != - && ${S[reboots]} == 1 && ${S[verified_at]} != 0 ]] || return 1
@@ -529,10 +629,24 @@ load_state() {
     validate_state
 }
 save_to() {
-    local path=$1 parent=${1%/*} tmp key
+    local path=$1 parent=${1%/*} tmp size
     validate_state && safe_dir "$parent" && [[ ! -L $path ]] || die 'Unsafe state destination or invalid state.'
-    tmp=$(mktemp "$parent/.kernel-update.XXXXXX") || return 1
-    if ! serialize_state > "$tmp" || ! chmod 0600 "$tmp" || ! sync -f "$tmp"; then
+    if [[ $path == "$STATE" ]]; then
+        [[ $parent == "$BASE" && $(stat -c %a -- "$parent") == 700 ]] &&
+            plain_file "$BASE/owner" && [[ $(cat "$BASE/owner") == "${S[task_id]}" ]] || die 'Unsafe task state staging directory.'
+        # Only this private, task-owned pathname can contain an interrupted
+        # write. STATE is authoritative until the atomic rename completes.
+        tmp=$STATE.next
+        if [[ -e $tmp || -L $tmp ]]; then
+            plain_file "$tmp" && [[ $(stat -c %a -- "$tmp") == 600 ]] || die 'Unsafe task state staging file.'
+            rm -- "$tmp" || return 1
+        fi
+        (umask 077; set -o noclobber; : > "$tmp") || return 1
+    else
+        tmp=$(mktemp "$parent/.kernel-update.XXXXXX") || return 1
+    fi
+    if ! serialize_state > "$tmp" || ! size=$(stat -c %s -- "$tmp") || [[ $size -gt 32768 ]] ||
+       ! chmod 0600 "$tmp" || ! sync -f "$tmp"; then
         rm -- "$tmp" || true; return 1
     fi
     if ! mv -T -- "$tmp" "$path"; then rm -- "$tmp" || true; return 1; fi
@@ -548,8 +662,10 @@ receipt_field() {
     awk -F '\t' -v k="$key" '$1==k {n++; if(NF!=2)bad=1; v=$2} END{if(n!=1||bad)exit 1; print v}' "$path"
 }
 previous_complete() {
+    local format
     plain_file "$RESULT" && (( $(stat -c %s -- "$RESULT") <= 32768 )) || return 1
-    [[ $(receipt_field "$RESULT" format) == 1 && $(receipt_field "$RESULT" phase) == done &&
+    format=$(receipt_field "$RESULT" format) || return 1
+    [[ ( $format == 1 || $format == 2 ) && $(receipt_field "$RESULT" phase) == done &&
        $(receipt_field "$RESULT" result_status) == complete && $(receipt_field "$RESULT" failed) == no &&
        $(receipt_field "$RESULT" machine_id) == "$(cat /etc/machine-id)" ]] || return 1
     uuid_ok "$(receipt_field "$RESULT" task_id)"
@@ -562,6 +678,7 @@ check_initialization() {
 }
 check_os() {
     [[ $(id -u) == 0 ]] || die 'Run as root.'
+    nv_notice_lock_dir_ok /root || die 'root 主目录须由 root 独占访问，才能安全保存登录通知。'
     grep -Eq '^ID=(debian|"debian")$' /etc/os-release && grep -Eq '^VERSION_ID=(13|"13")$' /etc/os-release || die 'Debian 13 is required.'
     [[ $(dpkg --print-architecture) == amd64 && -d /run/systemd/system ]] || die 'amd64 and systemd are required.'
     if systemd-detect-virt --container --quiet; then die 'Containers are unsupported.'; fi
@@ -762,11 +879,11 @@ official_apt_clear_partial_links() {
 
 official_apt_check_tree() {
     local root path relative name
-    local -a paths=()
+    local -a scanned_paths=()
     root=$(official_apt_root)
     official_apt_dir_ok "$root" || return 1
-    official_apt_collect_paths "$root" paths || return 1
-    for path in "${paths[@]}"; do
+    official_apt_collect_paths "$root" scanned_paths || return 1
+    for path in "${scanned_paths[@]}"; do
         relative=${path#"$root"/}
         case $relative in
             owner|apt.conf|empty.conf|official.sources|preferences|auth.conf)
@@ -804,6 +921,10 @@ official_apt_check_tree() {
             *) return 1 ;;
         esac
     done
+    if (( $# )); then
+        local -n validated_paths=$1
+        validated_paths=("${scanned_paths[@]}")
+    fi
 }
 official_apt_prepare() {
     local root directory content
@@ -879,15 +1000,17 @@ official_apt_recover_indexes() {
     if ! official_apt_ready; then strict_update; fi
 }
 official_apt_cleanup() {
-    local root path
+    local root owner path
     local -a paths=()
     root=$(official_apt_root)
     [[ -e $root || -L $root ]] || return 0
-    official_apt_file_ok "$root/owner" && [[ $(cat "$root/owner") == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
-    official_apt_check_tree || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+    official_apt_dir_ok "${root%/*}" && official_apt_dir_ok "$root" && official_apt_file_ok "$root/owner" || die '更新暂存目录或归属记录不安全，未执行清理。'
+    owner=$(cat "$root/owner") || die '无法读取更新暂存目录的归属记录，未执行清理。'
+    [[ $owner == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
+    official_apt_check_tree paths || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
     official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
-    # Delete only the previously checked regular files; never recurse with rm.
-    official_apt_collect_paths "$root" paths || return 1
+    # Reuse the checked paths. Download users may write to partial directories
+    # but cannot replace the root-controlled parents of these flat paths.
     for path in "${paths[@]}"; do
         [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
     done
@@ -1051,19 +1174,31 @@ verify_preserved() {
         [[ $probe == 'install /bin/false' || $probe == 'install /bin/false '* ]] || die 'Balloon module load prevention is ineffective.'
     fi
 }
-verify_target() {
-    local parsed pkg abi version
-    official_apt_recover_indexes
-    boot_ready "${S[boot_before]}" "$(boot_id)" "${S[target_abi]}" "$(uname -r)" || die 'The planned new boot and target kernel have not both been verified.'
-    [[ $(dpkg-query -W -f='${Version}' "${S[meta]}") == "${S[meta_version]}" && $(candidate "${S[meta]}") == "${S[meta_version]}" ]] || die 'Kernel metapackage or candidate changed during this task.'
-    parsed=$(parse_dependency "${S[meta]}" "$(dpkg-query -W -f='${Depends}' "${S[meta]}")") || die 'Installed metapackage dependency is unsupported.'
+verify_installed_target() {
+    local parsed pkg abi version audit meta_version dependency target_version
+    meta_version=$(dpkg-query -W -f='${Version}' "${S[meta]}") || die 'Cannot read the installed metapackage version.'
+    installed "${S[meta]}" && [[ $meta_version == "${S[meta_version]}" ]] || die 'Installed kernel metapackage changed during this task.'
+    dependency=$(dpkg-query -W -f='${Depends}' "${S[meta]}") || die 'Cannot read the installed metapackage dependency.'
+    parsed=$(parse_dependency "${S[meta]}" "$dependency") || die 'Installed metapackage dependency is unsupported.'
     IFS=$'\t' read -r pkg abi version <<< "$parsed"
     [[ $pkg == "${S[target_pkg]}" && $abi == "${S[target_abi]}" && $version == "${S[target_version]}" ]] || die 'Installed kernel dependency differs from the recorded target.'
-    installed "$pkg" && [[ $(dpkg-query -W -f='${Version}' "$pkg") == "$version" ]] || die 'Target kernel package is not fully installed at the required version.'
+    target_version=$(dpkg-query -W -f='${Version}' "$pkg") || die 'Cannot read the target kernel package version.'
+    installed "$pkg" && [[ $target_version == "$version" ]] || die 'Target kernel package is not fully installed at the required version.'
     [[ -s $BOOT_DIR/vmlinuz-$abi && -s $BOOT_DIR/initrd.img-$abi && -r $BOOT_DIR/config-$abi ]] || die 'Target boot files are missing.'
+    audit=$(dpkg --audit) || die 'Cannot inspect the dpkg database.'
+    [[ -z $audit ]] || die 'dpkg reports incomplete packages.'
+}
+verify_target() {
+    local abi=${S[target_abi]} current_candidate
+    boot_ready "${S[boot_before]}" "$(boot_id)" "$abi" "$(uname -r)" || die 'The planned new boot and target kernel have not both been verified.'
+    verify_installed_target
     plain_file "$BOOT_DIR/vmlinuz-$abi" && nv_kernel_image_matches "$BOOT_DIR/vmlinuz-$abi" "$(uname -r)" "$(uname -v)" || die 'The running kernel build differs from the target boot image.'
-    [[ -z $(dpkg --audit) ]] || die 'dpkg reports incomplete packages.'
-    apt_run check
+    if [[ ${S[phase]} != cleanup ]]; then
+        official_apt_recover_indexes
+        current_candidate=$(candidate "${S[meta]}") || die 'Cannot read the official kernel metapackage candidate.'
+        [[ $current_candidate == "${S[meta_version]}" ]] || die 'Kernel metapackage candidate changed during this task.'
+        apt_run check
+    fi
     verify_preserved
 }
 
@@ -1096,7 +1231,11 @@ verify_owned() {
     plain_file "$WORKER" && [[ $(sha "$WORKER") == "${S[script_sha]}" ]] || die 'Worker payload changed.'
     for f in "$BASE"/* "$BASE"/.[!.]* "$BASE"/..?*; do
         [[ -e $f || -L $f ]] || continue
-        case $f in "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner"|"$PURGE_MANIFEST") plain_file "$f" || die 'Unsafe task file.' ;; *) die "Unknown task residual: $f" ;; esac
+        case $f in
+            "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner") plain_file "$f" || die 'Unsafe task file.' ;;
+            "$STATE.next") plain_file "$f" && [[ $(stat -c %a -- "$f") == 600 ]] || die 'Unsafe task state staging file.' ;;
+            *) die "Unknown task residual: $f" ;;
+        esac
     done
 }
 bootstrap_temp_cleanup() {
@@ -1165,7 +1304,7 @@ launch() {
     nv_ui_launch "next-vps-setup $VERSION · 内核维护" '3–10' "$RESULT" "$LOG"
 }
 install_target() {
-    local plan parsed pkg abi version old
+    local plan
     strict_update
     target_from_index; save_state
     plan=$(apt_run -s --no-remove --no-install-recommends install "${S[meta]}=${S[meta_version]}")
@@ -1180,64 +1319,66 @@ install_target() {
         dpkg --compare-versions "$ver" le "${S[target_version]}" || die 'A newer kernel is already installed; no old kernel was deleted.'
     done <<< "$inv"
     apt_run -y --no-remove --no-install-recommends install "${S[meta]}=${S[meta_version]}"
-    [[ -z $(dpkg --audit) ]] || die 'Kernel installation left incomplete packages.'
+    verify_installed_target
     apt_run check
-    parsed=$(parse_dependency "${S[meta]}" "$(dpkg-query -W -f='${Depends}' "${S[meta]}")") || die 'Cannot identify installed target kernel.'
-    IFS=$'\t' read -r pkg abi version <<< "$parsed"
-    [[ $pkg == "${S[target_pkg]}" && $abi == "${S[target_abi]}" && $version == "${S[target_version]}" ]] || die 'Installed dependency differs from the approved target.'
-    installed "$pkg" && [[ $(dpkg-query -W -f='${Version}' "$pkg") == "$version" ]] || die 'Target package version differs.'
-    [[ -s $BOOT_DIR/vmlinuz-$abi && -s $BOOT_DIR/initrd.img-$abi && -r $BOOT_DIR/config-$abi ]] || die 'Target boot files are missing.'
-    balloon_mode "$abi" >/dev/null || die 'Target kernel has built-in/unknown balloon support; old kernels were not deleted.'
+    balloon_mode "${S[target_abi]}" >/dev/null || die 'Target kernel has built-in/unknown balloon support; old kernels were not deleted.'
     local current_config
     current_config=$(config_hash) || die '无法完整读取持久配置，已停止自动重启。'
     [[ $current_config == "${S[config_sha]}" ]] || die 'Persistent configuration changed during installation; inspect before rebooting.'
     S[phase]=reboot; save_state
 }
 purge_old() {
-    local inv old plan pkg status
+    local inv old plan pkg version current_inventory candidates approved approved_plan
     verify_target
-    inv=$(inventory)
-    old=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$inv") || die 'Unknown, mixed, equal-version or newer kernel found; no purge was started.'
-    if [[ -n $old ]]; then
+    inv=$(inventory) || die 'Cannot read the kernel inventory for purge.'
+    candidates=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$inv" yes) || die 'Unknown, mixed, equal-version or newer kernel found; no purge was started.'
+    approved_plan=${S[purge_plan]}
+    if [[ -n $candidates ]]; then
+        if [[ $approved_plan == - ]]; then approved_plan=${candidates//$'\n'/,}; fi
+        approved=$(purge_plan_remaining "$candidates" "$approved_plan") || die 'The remaining old packages differ from the original purge plan.'
         local -a selectors=()
-        while IFS= read -r pkg; do selectors+=("?exact-name($pkg)"); done <<< "$old"
+        old=
+        while IFS=$'\t' read -r pkg version; do
+            selectors+=("?exact-name($pkg)")
+            old+=${old:+$'\n'}$pkg
+        done <<< "$approved"
         plan=$(apt_run -s purge "${selectors[@]}")
         printf '%s\n' "$plan"
         validate_purge_plan "$plan" "$old" || die 'Purge simulation includes operations outside the exact old-kernel list.'
         verify_target
-        [[ $(inventory) == "$inv" ]] || die 'Kernel package inventory changed after simulation.'
-        # Persist an exact package+version allowlist for the in-transaction hook.
-        if [[ -e $PURGE_MANIFEST || -L $PURGE_MANIFEST ]]; then plain_file "$PURGE_MANIFEST" || die 'Unsafe purge manifest.'; fi
-        : > "$PURGE_MANIFEST"
-        while IFS= read -r pkg; do
-            printf '%s\t%s\n' "$pkg" "$(dpkg-query -W -f='${Version}' "$pkg")" >> "$PURGE_MANIFEST"
-        done <<< "$old"
-        chmod 0600 "$PURGE_MANIFEST"; sync -f "$PURGE_MANIFEST"
-        S[purge_sha]=$(sha "$PURGE_MANIFEST"); save_state
+        current_inventory=$(inventory) || die 'Cannot re-read the kernel package inventory after simulation.'
+        [[ $current_inventory == "$inv" ]] || die 'Kernel package inventory changed after simulation.'
+        # The plan and its hash are one durable state update. Retrying after
+        # partial removal keeps the original plan and only targets survivors.
+        if [[ ${S[purge_plan]} == - ]]; then
+            S[purge_plan]=$approved_plan
+            S[purge_sha]=$(purge_plan_digest "$approved_plan") || die 'Cannot hash the approved purge plan.'
+            save_state
+        fi
         # APT owns its transaction locks. Its hooks maintain initramfs and GRUB.
         apt_run -o "DPkg::Pre-Install-Pkgs::=$WORKER --apt-guard" \
             -o "DPkg::Tools::Options::$WORKER::Version=2" -o "DPkg::Tools::Options::$WORKER::InfoFD=0" \
             -y purge "${selectors[@]}"
-        while IFS= read -r pkg; do
-            status=$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null) || status=absent
-            [[ $status == absent || $status == not-installed ]] || die 'An old kernel package was not fully purged.'
-        done <<< "$old"
-        if [[ ${S[removed]} == - ]]; then S[removed]=${old//$'\n'/,}; else S[removed]=${S[removed]},${old//$'\n'/,}; fi
     fi
     verify_target
-    old=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$(inventory)") || die 'Final kernel inventory is unsupported.'
+    inv=$(inventory) || die 'Cannot read the final kernel inventory.'
+    old=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$inv") || die 'Final kernel inventory is unsupported.'
     [[ -z $old ]] || die 'Old installed kernel packages remain.'
+    if [[ $approved_plan != - ]]; then
+        purge_plan_remaining '' "$approved_plan" || die 'The recorded purge plan is invalid.'
+        S[removed]=$(purge_plan_names "$approved_plan") || die 'Cannot read the approved old package names.'
+    fi
     S[verified_boot]=$(boot_id); S[verified_at]=$(date +%s)
     S[phase]=cleanup; S[result_status]=cleanup_pending; save_state; save_to "$RESULT"
 }
 cleanup() {
-    local remaining
-    verify_target; verify_owned
-    remaining=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$(inventory)") || die 'Cleanup inventory is unsupported.'
-    [[ -z $remaining ]] || die 'Old kernels appeared after verification; cleanup was stopped.'
+    local inv remaining
     [[ ${S[result_status]} == cleanup_pending ]] || die 'No verified cleanup receipt.'
+    verify_target; verify_owned
+    inv=$(inventory) || die 'Cannot read the kernel inventory for cleanup.'
+    remaining=$(select_old "${S[meta]}" "${S[target_pkg]}" "${S[target_version]}" "$inv") || die 'Cleanup inventory is unsupported.'
+    [[ -z $remaining ]] || die 'Old kernels appeared after verification; cleanup was stopped.'
     save_to "$RESULT"
-    apt_run clean
     # The hook is staged now but cannot display success until RESULT is final.
     publish_login_notice success
     if [[ -e $UNIT_FILE || -L $UNIT_FILE ]]; then
@@ -1253,7 +1394,7 @@ cleanup() {
     fi
     verify_owned
     official_apt_cleanup
-    [[ ! -e $PURGE_MANIFEST ]] || rm -- "$PURGE_MANIFEST"
+    [[ ! -e $STATE.next ]] || rm -- "$STATE.next"
     rm -- "$STATE" "$BASE/owner" "$WORKER"
     [[ ! -e $LOG ]] || rm -- "$LOG"
     rmdir -- "$BASE"
@@ -1289,6 +1430,7 @@ on_error() {
     exit "$code"
 }
 worker() {
+    local current_boot
     [[ $0 == "$WORKER" ]] || die 'Invalid worker path.'
     load_state "$STATE" || die 'Invalid task state.'
     [[ ${S[machine_id]} == "$(cat /etc/machine-id)" && ${S[failed]} == no ]] || die 'Wrong machine or a failed task requires explicit --resume.'
@@ -1302,15 +1444,17 @@ worker() {
             install) install_target ;;
             reboot)
                 # Do not call the stage in a conditional: that disables errexit inside it.
-                if [[ ${S[reboots]} == 0 ]]; then
-                    S[boot_before]=$(boot_id); S[reboots]=1; save_state
+                current_boot=$(boot_id) || die 'Cannot read the current boot ID.'
+                if [[ ${S[reboots]} == 0 || ( ${S[boot_before]} == "$current_boot" && ${S[reboot_retry]} == yes ) ]]; then
+                    verify_installed_target; verify_preserved
+                    S[boot_before]=$current_boot; S[reboots]=1; S[reboot_retry]=no; save_state
                     nv_ui_heading '即将自动重启 · 旧内核暂时保留'
                     note '新内核启动核验通过后才会清理旧版本。请稍后使用原 SSH 账号和端口手动重连。'
                     sync; REBOOTING=yes; systemctl reboot
                     return 0
                 fi
-                [[ $(boot_id) != "${S[boot_before]}" ]] || die 'Reboot has not occurred; reboot manually after inspecting the task.'
-                S[phase]=verify; save_state ;;
+                [[ $current_boot != "${S[boot_before]}" ]] || die 'Reboot has not occurred. Inspect the task and use the original script with --resume to retry the pending reboot.'
+                S[phase]=verify; S[reboot_retry]=no; save_state ;;
             verify) verify_target; note "Running kernel build: $(uname -v)"; S[phase]=purge; save_state ;;
             purge) purge_old ;;
             cleanup) cleanup; return 0 ;;
@@ -1330,16 +1474,22 @@ print_status() {
         printf '%s\n' '结果：内核核验通过，任务文件尚未清理完成。请使用同一版本 --resume。'
     else printf '%s\n' '结果：尚未完成。后台可能仍在执行，请查看日志。'; fi
 }
-prepare() {
-    local entry=$1 meta=$2 key
-    safe_entry "$entry" || die 'Use an absolute, root-owned regular file under /root.'
+check_new_task_paths() {
+    local apt_root
+    apt_root=$(official_apt_root)
     [[ ! -e $BASE && ! -L $BASE && ! -e $UNIT_FILE && ! -L $UNIT_FILE ]] || die 'Task paths already exist; nothing was overwritten.'
+    [[ ! -e $apt_root && ! -L $apt_root ]] || die 'An existing private APT directory requires inspection; it was not changed.'
     [[ ! -L $RESULT ]] || die 'Result path is a symlink.'
     if [[ -e $RESULT ]]; then previous_complete || die 'An incomplete, invalid or foreign result requires inspection.'; fi
-    S=([format]=1 [version]="$VERSION" [task_id]="$(cat "$PROC_DIR/sys/kernel/random/uuid")" [machine_id]="$(cat /etc/machine-id)"
+}
+prepare() {
+    local entry=$1 meta=$2
+    safe_entry "$entry" || die 'Use an absolute, root-owned regular file under /root.'
+    check_new_task_paths
+    S=([format]=2 [version]="$VERSION" [task_id]="$(cat "$PROC_DIR/sys/kernel/random/uuid")" [machine_id]="$(cat /etc/machine-id)"
        [phase]=install [failed]=no [result_status]=running [meta]="$meta" [meta_version]=- [target_pkg]=- [target_abi]=- [target_version]=-
-       [boot_before]="$(boot_id)" [verified_boot]=- [reboots]=0 [entry]="$entry" [entry_id]="$(identity "$entry")" [script_sha]="$(sha "$entry")"
-       [config_sha]=- [ssh_sha]=- [swap_sha]=- [swappiness]=0 [services]=ssh.service,fail2ban.service [balloon]=absent [removed]=- [verified_at]=0 [purge_sha]=-)
+       [boot_before]="$(boot_id)" [verified_boot]=- [reboots]=0 [reboot_retry]=no [entry]="$entry" [entry_id]="$(identity "$entry")" [script_sha]="$(sha "$entry")"
+       [config_sha]=- [ssh_sha]=- [swap_sha]=- [swappiness]=0 [services]=ssh.service,fail2ban.service [balloon]=absent [removed]=- [verified_at]=0 [purge_sha]=- [purge_plan]=-)
     snapshot
     # Replace an earlier completed receipt before launching the new task, so
     # even a failed worker copy cannot leave the earlier success as this result.
@@ -1355,7 +1505,7 @@ prepare() {
     write_unit; launch
 }
 resume_task() {
-    local entry=$1 recovery=no f bootstrap=no
+    local entry=$1 recovery=no f bootstrap=no current_boot
     if [[ -e $STATE ]]; then
         load_state "$STATE" || die 'Invalid existing state.'
         if [[ ${S[phase]} == cleanup && ${S[result_status]} == cleanup_pending ]]; then recovery=yes; fi
@@ -1381,7 +1531,11 @@ resume_task() {
         plain_file "$BASE/owner" && [[ $(cat "$BASE/owner") == "${S[task_id]}" ]] || die 'Unowned or foreign bootstrap data was not adopted.'
         for f in "$BASE"/* "$BASE"/.[!.]* "$BASE"/..?*; do
             [[ -e $f || -L $f ]] || continue
-            case $f in "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner") plain_file "$f" || die 'Unsafe bootstrap recovery file.' ;; *) die 'Unknown bootstrap residual; it was not changed.' ;; esac
+            case $f in
+                "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner") plain_file "$f" || die 'Unsafe bootstrap recovery file.' ;;
+                "$STATE.next") plain_file "$f" && [[ $(stat -c %a -- "$f") == 600 ]] || die 'Unsafe task state staging file.' ;;
+                *) die 'Unknown bootstrap residual; it was not changed.' ;;
+            esac
         done
         if [[ -e $WORKER || -L $WORKER ]]; then
             plain_file "$WORKER" && [[ $(sha "$WORKER") == "${S[script_sha]}" ]] || die 'Bootstrap worker changed; it was not overwritten.'
@@ -1391,7 +1545,11 @@ resume_task() {
         safe_dir "$BASE" || die 'Unsafe recovery directory.'
         for f in "$BASE"/* "$BASE"/.[!.]* "$BASE"/..?*; do
             [[ -e $f || -L $f ]] || continue
-            case $f in "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner"|"$PURGE_MANIFEST") plain_file "$f" || die 'Unsafe recovery file.' ;; *) die 'Unknown recovery residual.' ;; esac
+            case $f in
+                "$WORKER"|"$STATE"|"$LOG"|"$BASE/owner") plain_file "$f" || die 'Unsafe recovery file.' ;;
+                "$STATE.next") plain_file "$f" && [[ $(stat -c %a -- "$f") == 600 ]] || die 'Unsafe task state staging file.' ;;
+                *) die 'Unknown recovery residual.' ;;
+            esac
         done
         if [[ -e $BASE/owner ]]; then [[ $(cat "$BASE/owner") == "${S[task_id]}" ]] || die 'Recovery owner differs.'; fi
         if [[ -e $WORKER ]]; then [[ $(sha "$WORKER") == "${S[script_sha]}" ]] || die 'Recovery worker differs.'; fi
@@ -1403,6 +1561,11 @@ resume_task() {
     # Re-upload after interrupted cleanup has a new inode; only explicit resume
     # with the recorded path and identical payload may adopt that new inode.
     S[entry_id]=$(identity "$entry")
+    if [[ ${S[phase]} == reboot && ${S[reboots]} == 1 ]]; then
+        current_boot=$(boot_id) || die 'Cannot read the current boot ID.'
+        S[reboot_retry]=no
+        if [[ $current_boot == "${S[boot_before]}" ]]; then S[reboot_retry]=yes; fi
+    fi
     S[failed]=no; save_state; save_to "$RESULT"
     [[ -e $UNIT_FILE || -L $UNIT_FILE ]] || write_unit
     launch
@@ -1439,10 +1602,13 @@ main() {
     if [[ -e $STATE || -L $STATE ]]; then
         load_state "$STATE" || die 'Invalid existing state.'
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'Existing task belongs to another machine.'
-        print_status; return
+        print_status
+        if [[ $mode == --check ]]; then return 1; fi
+        return 0
     fi
     check_sources; meta=$(choose_meta); check_space
     if [[ $mode == --check ]]; then
+        check_new_task_paths
         S[meta]=$meta; snapshot
         printf 'CHECK_OK: meta=%s. 本机条件已通过；正式执行时将使用隔离的 Debian 官方索引确定目标。\n' "$meta"
         return

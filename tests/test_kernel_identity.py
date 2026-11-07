@@ -161,9 +161,6 @@ class ActualAptGuardIdentityTests(unittest.TestCase):
         self.image = self.boot / f"vmlinuz-{ABI}"
         self.image.write_bytes(image_bytes())
         self.image.chmod(0o600)
-        self.manifest = self.task / "purge.tsv"
-        self.manifest.write_text(f"{OLD}\t{OLD_VERSION}\n")
-        self.manifest.chmod(0o600)
         self.approved = self.root / "protocol-approved"
         self.dpkg_calls = self.root / "dpkg-called"
         self.dpkg_queries = self.root / "query-called"
@@ -180,25 +177,26 @@ class ActualAptGuardIdentityTests(unittest.TestCase):
         self.assertFalse(self.deny_log.exists(), self.deny_log.read_text() if self.deny_log.exists() else "")
         self.assertFalse(self.dpkg_calls.exists(), "no real package operation is allowed")
 
-    def run_guard(self, build: str) -> subprocess.CompletedProcess[str]:
+    def run_guard(self, build: str, *, extra_inventory: str = "") -> subprocess.CompletedProcess[str]:
         version = None
         for line in UPDATER.read_text(encoding="utf-8").splitlines():
             if line.startswith("VERSION="):
                 version = line.split("=", 1)[1]
                 break
         self.assertIsNotNone(version)
+        plan = f"{OLD}={OLD_VERSION}"
         state = {
-            "format": "1", "version": version, "task_id": BEFORE,
+            "format": "2", "version": version, "task_id": BEFORE,
             "machine_id": "a" * 32, "phase": "purge", "failed": "no",
             "result_status": "running", "meta": META, "meta_version": VERSION,
             "target_pkg": TARGET, "target_abi": ABI, "target_version": VERSION,
-            "boot_before": BEFORE, "verified_boot": "-", "reboots": "1",
+            "boot_before": BEFORE, "verified_boot": "-", "reboots": "1", "reboot_retry": "no",
             "entry": "/root/next-vps-kernel-update.sh", "entry_id": "2049:123",
             "script_sha": hashlib.sha256(UPDATER.read_bytes()).hexdigest(),
             "config_sha": "b" * 64, "ssh_sha": "c" * 64, "swap_sha": "d" * 64,
             "swappiness": "10", "services": "ssh.service,fail2ban.service",
             "balloon": "module", "removed": "-", "verified_at": "0",
-            "purge_sha": hashlib.sha256(self.manifest.read_bytes()).hexdigest(),
+            "purge_sha": hashlib.sha256((plan + "\n").encode()).hexdigest(), "purge_plan": plan,
         }
         state_path = self.task / "state.tsv"
         state_path.write_text("".join(f"{key}\t{value}\n" for key, value in state.items()))
@@ -209,7 +207,6 @@ source "$UPDATER"
 WORKER=$0
 BASE=$FIXTURE_ROOT/task
 STATE=$BASE/state.tsv
-PURGE_MANIFEST=$BASE/purge.tsv
 BOOT_DIR=$FIXTURE_ROOT/boot
 APT_HOOK_INFO_FD=0
 sha() {
@@ -236,6 +233,10 @@ dpkg-query() {
     printf '%s\n' "$*" >> "$QUERY_LOG"
     local pkg=${!#}
     case "$*" in
+        *'${db:Status-Status}\t${Package}\t'*)
+            printf 'installed\t%s\t%s\tDebian Kernel Team\n' \
+                "$FIXTURE_META" "$FIXTURE_VERSION" "$FIXTURE_TARGET" "$FIXTURE_VERSION" "$FIXTURE_OLD" "$FIXTURE_OLD_VERSION"
+            if [[ -n $EXTRA_INVENTORY ]]; then printf '%s\n' "$EXTRA_INVENTORY"; fi ;;
         *'${db:Status-Status}'*) printf 'installed' ;;
         *'${Version}'*)
             if [[ $pkg == "$FIXTURE_OLD" ]]; then printf '%s' "$FIXTURE_OLD_VERSION"
@@ -262,7 +263,8 @@ apt_guard
         env.update({
             "UPDATER": str(UPDATER), "FIXTURE_ROOT": str(self.root),
             "FIXTURE_ABI": ABI, "FIXTURE_BUILD": build, "FIXTURE_VERSION": VERSION,
-            "FIXTURE_TARGET": TARGET, "FIXTURE_OLD": OLD, "FIXTURE_OLD_VERSION": OLD_VERSION,
+            "FIXTURE_META": META, "FIXTURE_TARGET": TARGET, "FIXTURE_OLD": OLD, "FIXTURE_OLD_VERSION": OLD_VERSION,
+            "EXTRA_INVENTORY": extra_inventory,
             "QUERY_LOG": str(self.dpkg_queries), "DPKG_LOG": str(self.dpkg_calls),
             "APPROVED_LOG": str(self.approved), "DENY_LOG": str(self.deny_log),
             "REAL_DPKG": self.real_dpkg, "PATH": f"{self.bin}:/usr/bin:/bin", "LC_ALL": "C",
@@ -285,6 +287,14 @@ apt_guard
         self.assertIn("cannot confirm the running target kernel build", proc.stderr)
         self.assertFalse(self.approved.exists())
         self.assertFalse(self.dpkg_queries.exists())
+
+    def test_actual_guard_rejects_unapproved_old_kernel_found_under_lock(self) -> None:
+        proc = self.run_guard(
+            BUILD, extra_inventory="installed\tlinux-image-6.12.107+deb13-cloud-amd64\t6.12.107-1\tDebian Kernel Team",
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("durable purge plan", proc.stderr)
+        self.assertFalse(self.approved.exists())
 
 
 if __name__ == "__main__":

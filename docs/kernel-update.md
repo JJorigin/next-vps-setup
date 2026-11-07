@@ -1,12 +1,12 @@
 # Debian 13 内核维护
 
-`next-vps-kernel-update.sh` V1.3 是 `next-vps-setup` 的配套工具，用于初始化完成后的内核更新。
+`next-vps-kernel-update.sh` V1.4 是 `next-vps-setup` 的配套工具，用于初始化完成后的内核更新。
 
 工具更新 Debian 官方稳定源内核，保留原来的 cloud／标准 amd64 系列，自动重启一次。新启动核验通过后，动态清理旧内核，只保留本次目标内核和原系列元包。原初始化配置和结果文件保留，不执行整套软件包升级。
 
 ## 开始前确认
 
-- Debian 13、amd64、systemd 虚拟机，使用 root。
+- Debian 13、amd64、systemd 虚拟机，使用 root。`/root` 由 root 独占访问，例如权限为 `0700`。
 - 本机已有成功完成的 `next-vps-setup` 初始化结果；无需重新初始化。
 - 根分区至少512MiB空闲、`/boot` 至少200MiB空闲、可用内存至少128MiB。
 - SSH 和 Fail2ban 正常运行，重要数据已备份，商家控制台可用。
@@ -24,7 +24,7 @@ GitHub：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.3/next-vps-kernel-update.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.4/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -35,21 +35,21 @@ jsDelivr：
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.3/next-vps-kernel-update.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.4/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
 bash /root/next-vps-kernel-update.sh --check
 ```
 
-没有 `curl` 时，可从仓库下载文件，上传到 `/root/next-vps-kernel-update.sh`，再执行：
+没有 `curl` 或 CA 证书时，可从 [V1.4 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.4) 下载脚本并上传到 `/root/next-vps-kernel-update.sh`。上传后执行以下命令。
 
 ```bash
-chmod 700 /root/next-vps-kernel-update.sh
+chmod 700 /root/next-vps-kernel-update.sh &&
 bash /root/next-vps-kernel-update.sh --check
 ```
 
-`--check` 只检查本机条件，不刷新软件索引、不安装软件、不删除内核、不重启。正式开始后才获取官方更新。
+`--check` 只读取本机条件。看到 `CHECK_OK` 后可启动维护，正式执行时才获取官方更新。
 
 ## 执行维护
 
@@ -69,7 +69,7 @@ bash /root/next-vps-kernel-update.sh
 
 即使内核名称没有变化，也会执行新启动核验。工具不额外安装推荐包，不做全局 `autoremove`。
 
-维护保留原 SSH 账号、密码、认证方式和端口，以及维护前的 Swap 与 `swappiness`。V1.3 比较 Swap 的路径、容量和优先级，不将正常变化的已用量计入摘要；读取失败时会停止，不放行后续删除。
+维护会核对原 SSH 认证与监听设置、Swap 路径、容量、优先级和 `swappiness`。Swap 已用量可以正常变化。读取失败或核对不一致时，任务会在删除前停止。
 
 若维护前 `x-ui.service` 正在运行，也会检查重启后是否恢复运行。进程运行状态不能代替面板访问、证书或节点连通测试，完成后仍应实际检查自己的业务。
 
@@ -77,7 +77,7 @@ bash /root/next-vps-kernel-update.sh
 
 重启会断开 SSH，需手动重新连接。首次断线后先等待约3～10分钟；下载、开机或服务恢复较慢时需要更久。
 
-后台任务成功或失败后，下次以 root 通过交互式 Bash SSH 登录，会显示一次结果，随后自动清理通知文件。没有看到提示时查询：
+任务成功或失败后，下次通过 SSH 直接登录 root（登录 Shell 为 Bash）会显示一次结果，随后自动清理通知文件。没有看到提示时，可查询结果文件。
 
 ```bash
 cat /var/lib/next-vps-kernel-update-result.tsv
@@ -123,11 +123,11 @@ bash /root/next-vps-kernel-update.sh --resume
 
 V1.2 若提示 `Swap or swappiness did not persist.`，可能是旧命令误将 Swap 已用量纳入摘要。该提示也可能对应真实配置变化，不能一律当作误报。
 
-请保留原版本脚本、状态和日志，先核对实际 Swap 与 `swappiness`。不要为消除报错而关闭或重建 Swap、改写结果摘要，也不要下载 V1.3 覆盖未完成任务。V1.3 不会自动迁移或接管旧版本任务；恢复方案需要基于该任务的实际记录判断。
+请保留原版本脚本、状态和日志，先核对实际 Swap 与 `swappiness`。旧版本任务仍须用原版本、相同内容的脚本处理。
 
 ### 旧版仅在前置检查停止
 
-若旧版仅在 `--check` 提示官方密钥文件不支持，且尚未创建维护任务，可以下载 V1.3 后重新检查。Debian 的官方 `.gpg` → `.pgp` 兼容链接无需手动修改或删除。
+若旧版仅在 `--check` 提示官方密钥文件不支持，且尚未创建维护任务，可以下载 V1.4 后重新检查。Debian 的官方 `.gpg` → `.pgp` 兼容链接无需手动修改或删除。
 
 ## 下次维护
 

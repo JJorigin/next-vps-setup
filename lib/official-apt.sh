@@ -178,11 +178,11 @@ official_apt_clear_partial_links() {
 
 official_apt_check_tree() {
     local root path relative name
-    local -a paths=()
+    local -a scanned_paths=()
     root=$(official_apt_root)
     official_apt_dir_ok "$root" || return 1
-    official_apt_collect_paths "$root" paths || return 1
-    for path in "${paths[@]}"; do
+    official_apt_collect_paths "$root" scanned_paths || return 1
+    for path in "${scanned_paths[@]}"; do
         relative=${path#"$root"/}
         case $relative in
             owner|apt.conf|empty.conf|official.sources|preferences|auth.conf)
@@ -220,6 +220,10 @@ official_apt_check_tree() {
             *) return 1 ;;
         esac
     done
+    if (( $# )); then
+        local -n validated_paths=$1
+        validated_paths=("${scanned_paths[@]}")
+    fi
 }
 official_apt_prepare() {
     local root directory content
@@ -295,15 +299,17 @@ official_apt_recover_indexes() {
     if ! official_apt_ready; then strict_update; fi
 }
 official_apt_cleanup() {
-    local root path
+    local root owner path
     local -a paths=()
     root=$(official_apt_root)
     [[ -e $root || -L $root ]] || return 0
-    official_apt_file_ok "$root/owner" && [[ $(cat "$root/owner") == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
-    official_apt_check_tree || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+    official_apt_dir_ok "${root%/*}" && official_apt_dir_ok "$root" && official_apt_file_ok "$root/owner" || die '更新暂存目录或归属记录不安全，未执行清理。'
+    owner=$(cat "$root/owner") || die '无法读取更新暂存目录的归属记录，未执行清理。'
+    [[ $owner == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
+    official_apt_check_tree paths || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
     official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
-    # Delete only the previously checked regular files; never recurse with rm.
-    official_apt_collect_paths "$root" paths || return 1
+    # Reuse the checked paths. Download users may write to partial directories
+    # but cannot replace the root-controlled parents of these flat paths.
     for path in "${paths[@]}"; do
         [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
     done

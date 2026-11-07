@@ -45,7 +45,7 @@ UNIT=fixture.service
 declare -A S=([result_status]=cleanup_pending [entry]="$FIXTURE_ROOT/entry.sh" [entry_path]="$FIXTURE_ROOT/entry.sh" [entry_id]=fixture [entry_identity]=fixture [script_sha]=fixture [entry_sha]=fixture [target_abi]=fixture [target_kernel]=fixture)
 S[ssh_port]=56789; S[meta]=fixture; S[target_pkg]=fixture; S[target_version]=fixture
 die(){ echo "$*" >&2; exit 93; }
-verify_all(){ :; }; verify_target(){ :; }; verify_owned(){ :; }; verify_task_files(){ :; }
+verify_configuration(){ :; }; snapshot_result(){ :; }; verify_target(){ :; }; verify_owned(){ :; }; verify_task_files(){ :; }
 select_old(){ :; }; inventory(){ :; }
 save_to(){ printf '%s\n' "${S[result_status]}" > "$1"; }; write_state_to(){ save_to "$1"; }
 apt_run(){ [[ $1 == clean ]]; }

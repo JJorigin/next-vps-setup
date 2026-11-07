@@ -7,6 +7,7 @@ replaced by deny-by-default stubs. Production ``main`` is never executed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -38,16 +39,16 @@ def inventory(*extra: str) -> str:
 
 def valid_state() -> dict[str, str]:
     return {
-        "format": "1", "version": "1.3", "task_id": BEFORE,
+        "format": "2", "version": "1.4", "task_id": BEFORE,
         "machine_id": "a" * 32, "phase": "install", "failed": "no",
         "result_status": "running", "meta": META, "meta_version": "-",
         "target_pkg": "-", "target_abi": "-", "target_version": "-",
-        "boot_before": BEFORE, "verified_boot": "-", "reboots": "0",
+        "boot_before": BEFORE, "verified_boot": "-", "reboots": "0", "reboot_retry": "no",
         "entry": "/root/next-vps-kernel-update.sh", "entry_id": "2049:123",
         "script_sha": "a" * 64, "config_sha": "b" * 64,
         "ssh_sha": "c" * 64, "swap_sha": "d" * 64, "swappiness": "10",
         "services": "ssh.service,fail2ban.service", "balloon": "module",
-        "removed": "-", "verified_at": "0", "purge_sha": "-",
+        "removed": "-", "verified_at": "0", "purge_sha": "-", "purge_plan": "-",
     }
 
 
@@ -111,7 +112,6 @@ BASE=$FIXTURE_ROOT/task
 STATE=$BASE/state.tsv
 WORKER=$BASE/worker.sh
 LOG=$BASE/run.log
-PURGE_MANIFEST=$BASE/purge.tsv
 RESULT=$FIXTURE_ROOT/result.tsv
 UNIT_FILE=$FIXTURE_ROOT/unit.service
 BOOT_DIR=$FIXTURE_ROOT/boot
@@ -294,11 +294,13 @@ SYS_DIR=$FIXTURE_ROOT/sys
 
     def test_verified_complete_state_is_valid(self) -> None:
         state = valid_state()
+        plan = f"{OLD1}=6.12.107-1,{OLD2}=6.12.113-1"
         state.update({
             "phase": "done", "result_status": "complete", "meta_version": PKG_VERSION,
             "target_pkg": TARGET, "target_abi": ABI, "target_version": PKG_VERSION,
             "verified_boot": AFTER, "reboots": "1", "verified_at": "1793792000",
-            "removed": OLD1 + "," + OLD2,
+            "removed": OLD1 + "," + OLD2, "purge_plan": plan,
+            "purge_sha": hashlib.sha256((plan + "\n").encode()).hexdigest(),
         })
         self.run_bash(assignments(state) + "\nvalidate_state")
 
@@ -316,7 +318,7 @@ SYS_DIR=$FIXTURE_ROOT/sys
         text = "".join(f"{k}\t{v}\n" for k, v in valid_state().items())
         fixtures = {
             "duplicate": text + "phase\tinstall\n", "unknown": text + "injected\tyes\n",
-            "nul": text.encode() + b"\0", "missing": text.replace("format\t1\n", ""),
+            "nul": text.encode() + b"\0", "missing": text.replace("format\t2\n", ""),
             "control": text.replace("phase\tinstall", "phase\tinstall\r"),
             "source-injection": text.replace("phase\tinstall", "phase\t$(touch bad)"),
         }
@@ -524,10 +526,12 @@ purge_old
     def test_purge_resumes_after_previous_old_image_already_disappeared(self) -> None:
         before = inventory(row(OLD2, "6.12.113-1"))
         proc = self.run_bash(self.purge_sandbox(before, f"Purg {OLD2} [6.12.113-1]") + r'''
+S[purge_plan]=linux-image-6.12.107+deb13-cloud-amd64=6.12.107-1,linux-image-6.12.113+deb13-cloud-amd64=6.12.113-1
+S[purge_sha]=$(purge_plan_digest "${S[purge_plan]}")
 purge_old
 printf '%s\n' "${S[removed]}"
 ''')
-        self.assertIn(OLD2, proc.stdout)
+        self.assertIn(f"{OLD1},{OLD2}", proc.stdout)
         actual = [line for line in self.calls.read_text().splitlines() if line.startswith("apt:") and " -y purge " in line]
         self.assertEqual(len(actual), 1)
         self.assertNotIn(OLD1, actual[0])
@@ -575,7 +579,8 @@ safe_dir() { [[ ( $1 == "$FIXTURE_ROOT" || $1 == "$FIXTURE_ROOT"/* ) && -d $1 &&
         for failure in ("serialize_state", "chmod", "sync", "mv"):
             with self.subTest(failure=failure):
                 task = self.root / "task"
-                task.mkdir(exist_ok=True)
+                task.mkdir(mode=0o700, exist_ok=True)
+                (task / "owner").write_text(BEFORE + "\n", encoding="utf-8")
                 state_path = task / "state.tsv"
                 state_path.write_text("previous-valid-state\n", encoding="utf-8")
                 body = (
@@ -585,11 +590,12 @@ safe_dir() { [[ ( $1 == "$FIXTURE_ROOT" || $1 == "$FIXTURE_ROOT"/* ) && -d $1 &&
                 proc = self.run_bash(body, check=False)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(state_path.read_text(), "previous-valid-state\n")
-                self.assertEqual(list(task.glob(".kernel-update.*")), [])
+                self.assertFalse((task / "state.tsv.next").exists())
 
     def test_atomic_save_writes_complete_reparseable_private_state(self) -> None:
         task = self.root / "task"
-        task.mkdir()
+        task.mkdir(mode=0o700)
+        (task / "owner").write_text(BEFORE + "\n", encoding="utf-8")
         proc = self.run_bash(assignments(valid_state()) + self.temporary_file_checks() + r'''
 save_to "$STATE"
 load_state "$STATE"
@@ -600,7 +606,7 @@ load_state "$STATE"
         actual = dict(line.split("\t", 1) for line in state_path.read_text().splitlines())
         self.assertEqual(actual, valid_state())
         self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(list(task.glob(".kernel-update.*")), [])
+        self.assertFalse((task / "state.tsv.next").exists())
 
     def cleanup_state(self) -> dict[str, str]:
         state = self.purge_state()
@@ -640,7 +646,6 @@ cleanup
         (task / "run.log").write_text("retained task log\n", encoding="utf-8")
         if extra_residual:
             (task / "unknown-user-file").write_text("do not adopt or delete", encoding="utf-8")
-        import hashlib
         state = self.cleanup_state() if cleanup_receipt else self.purge_state()
         state.update({"failed": "yes", "script_sha": hashlib.sha256((task / "worker.sh").read_bytes()).hexdigest()})
         destination = self.root / "result.tsv" if cleanup_receipt else task / "state.tsv"
@@ -665,12 +670,16 @@ launch() { printf 'launch:%s:%s\n' "${S[entry_id]}" "${S[failed]}" >> "$CALLS"; 
 
     def test_resume_adopts_reuploaded_identical_payload_new_inode(self) -> None:
         destination, body = self.resume_fixture()
+        staged = destination.with_name("state.tsv.next")
+        staged.write_text("partial state write\n", encoding="utf-8")
+        staged.chmod(0o600)
         self.run_bash(body + '\nresume_task /root/next-vps-kernel-update.sh\n')
         saved = dict(line.split("\t", 1) for line in destination.read_text().splitlines())
         self.assertEqual(saved["entry_id"], "2049:999")
         self.assertEqual(saved["failed"], "no")
         self.assertEqual(self.calls.read_text(), "launch:2049:999:no\n")
         self.assertTrue((self.root / "unit.service").exists())
+        self.assertFalse(staged.exists())
 
     def test_cleanup_receipt_resume_recreates_state_with_new_entry_inode(self) -> None:
         _, body = self.resume_fixture(cleanup_receipt=True)
@@ -693,10 +702,12 @@ resume_task /root/next-vps-kernel-update.sh
         self.assertFalse(self.calls.exists())
         self.assertEqual(destination.read_bytes(), before)
 
-    def test_resume_rejects_unfinished_12_task_without_changing_its_files(self) -> None:
+    def test_resume_rejects_unfinished_13_task_without_changing_its_files(self) -> None:
         destination, body = self.resume_fixture()
         destination.write_text(
-            destination.read_text(encoding="utf-8").replace("version\t1.3\n", "version\t1.2\n"),
+            destination.read_text(encoding="utf-8").replace("format\t2\n", "format\t1\n")
+            .replace("version\t1.4\n", "version\t1.3\n").replace("purge_plan\t-\n", "")
+            .replace("reboot_retry\tno\n", ""),
             encoding="utf-8", newline="\n",
         )
         before = {path.relative_to(self.root): path.read_bytes()
@@ -777,19 +788,21 @@ launch() {
         self.assertEqual(saved["failed"], "no")
         self.assertEqual(self.calls.read_text(), f"launch:{new_task}\n")
 
-    def test_prepare_starts_new_13_task_after_completed_12_receipt(self) -> None:
+    def test_prepare_starts_new_14_task_after_completed_13_receipt(self) -> None:
         result_path, new_task, body = self.prepare_fixture()
         result_path.write_text(
-            result_path.read_text(encoding="utf-8").replace("version\t1.3\n", "version\t1.2\n"),
+            result_path.read_text(encoding="utf-8").replace("format\t2\n", "format\t1\n")
+            .replace("version\t1.4\n", "version\t1.3\n").replace("purge_plan\t-\n", "")
+            .replace("reboot_retry\tno\n", ""),
             encoding="utf-8", newline="\n",
         )
         old = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
-        self.assertEqual(old["version"], "1.2")
+        self.assertEqual(old["version"], "1.3")
         self.assertEqual(old["result_status"], "complete")
         self.run_bash(body + '\nprepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64\n')
         saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
         state = dict(line.split("\t", 1) for line in (self.root / "task/state.tsv").read_text().splitlines())
-        self.assertEqual(saved["version"], "1.3")
+        self.assertEqual(saved["version"], "1.4")
         self.assertEqual(saved["task_id"], new_task)
         self.assertNotEqual(saved["task_id"], old["task_id"])
         self.assertEqual(saved["phase"], "install")
@@ -1049,6 +1062,8 @@ uname() { printf '%s\n' "$MOCK_RUNNING"; }
 save_state() { printf 'state:%s:%s\n' "${S[phase]}" "${S[reboots]}" >> "$CALLS"; }
 sync() { :; }
 systemctl() { printf 'systemctl:%s\n' "$*" >> "$CALLS"; }
+verify_installed_target() { :; }
+verify_preserved() { :; }
 verify_target() {
     boot_ready "${S[boot_before]}" "$(boot_id)" "${S[target_abi]}" "$(uname -r)" || die 'mock wrong boot/kernel'
 }
@@ -1068,6 +1083,13 @@ cleanup() { printf 'CLEANUP\n' >> "$CALLS"; }
         proc = self.run_bash(self.worker_sandbox("reboot", "1", BEFORE) + "\nworker", check=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(self.calls.exists())
+
+    def test_worker_retries_same_boot_only_when_explicitly_authorized(self) -> None:
+        self.run_bash(self.worker_sandbox("reboot", "1", BEFORE) + "\nS[reboot_retry]=yes\nworker")
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls.count("systemctl:reboot"), 1)
+        self.assertIn("state:reboot:1", calls)
+        self.assertNotIn("PURGE", calls)
 
     def test_worker_new_boot_wrong_kernel_does_not_purge(self) -> None:
         proc = self.run_bash(self.worker_sandbox("reboot", "1", AFTER, "6.12.113+deb13-cloud-amd64") + "\nworker", check=False)

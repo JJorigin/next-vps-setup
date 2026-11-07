@@ -28,8 +28,10 @@ class SshNoticeTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.profile = self.root / "profile.d"
         self.data = self.root / "data"
+        self.lock_dir = self.root / "root-home"
         self.profile.mkdir(mode=0o700)
         self.data.mkdir(mode=0o700)
+        self.lock_dir.mkdir(mode=0o700)
         self.hook = self.profile / f"{APP}-notice.sh"
         self.payload = self.data / f"{APP}-notice"
         self.receipt = self.data / f"{APP}-result.tsv"
@@ -42,6 +44,7 @@ class SshNoticeTests(unittest.TestCase):
         env.update({
             "NOTICE_MODULE": str(MODULE), "NOTICE_ROOT": str(self.root),
             "NV_NOTICE_PROFILE_DIR": str(self.profile), "NV_NOTICE_DATA_ROOT": str(self.data),
+            "NV_NOTICE_LOCK_DIR": str(self.lock_dir),
             "HOOK": str(self.hook), "TEST_ROOT": "yes", "LC_ALL": "C.UTF-8",
             "SSH_CONNECTION": "198.51.100.1 54321 203.0.113.1 56789",
         })
@@ -83,6 +86,7 @@ nv_notice_safe_dir() {
         self.assertFalse(self.payload.exists())
         self.assertEqual(list(self.profile.iterdir()), [])
         self.assertEqual(list(self.data.iterdir()), [self.receipt])
+        self.assertEqual(list(self.lock_dir.iterdir()), [])
 
     def test_source_only_defines_functions_and_creates_nothing(self) -> None:
         proc = self.shell('\nprintf "SOURCE_OK\\n"\n')
@@ -117,6 +121,7 @@ nv_notice_safe_dir() {
         self.assertIn("状态：失败", proc.stdout)
         self.assertIn("出错阶段：配置系统基础设置", proc.stdout)
         self.assertIn("tail -n 100 /var/lib/next-vps-setup/next-vps-setup.log", proc.stdout)
+        self.assertIn("journalctl -u next-vps-setup.service -n 100 --no-pager", proc.stdout)
         self.assertIn("bash /root/next-vps-setup.sh --resume", proc.stdout)
         self.assert_notice_gone()
 
@@ -178,6 +183,42 @@ nv_notice_safe_dir() {
         self.assertTrue(all(p.returncode == 0 for p in processes), results)
         self.assertEqual(sum(out.count("VPS 初始化已完成") for out, _ in results), 1)
         self.assert_notice_gone()
+
+    def test_public_profile_lock_does_not_block_new_notice(self) -> None:
+        import fcntl
+
+        fd = os.open(self.profile, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.write_receipt()
+            self.install()
+            self.assertIn("已完成", self.login().stdout)
+            self.assert_notice_gone()
+        finally:
+            os.close(fd)
+
+    def test_busy_private_lock_defers_login_without_consuming_notice(self) -> None:
+        import fcntl
+
+        self.write_receipt()
+        self.install()
+        fd = os.open(self.lock_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertNotIn("已完成", self.login().stdout)
+            self.assertTrue((self.payload / "notice.txt").exists())
+        finally:
+            os.close(fd)
+        self.assertIn("已完成", self.login().stdout)
+        self.assert_notice_gone()
+
+    def test_public_lock_directory_is_rejected_without_staging_notice(self) -> None:
+        self.lock_dir.chmod(0o755)
+        proc = self.install(check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("root 通知锁", proc.stderr)
+        self.assertEqual(list(self.profile.iterdir()), [])
+        self.assertEqual(list(self.data.iterdir()), [])
 
     def test_modified_payload_is_neither_displayed_nor_deleted(self) -> None:
         self.write_receipt()
@@ -241,6 +282,26 @@ source "$HOOK"
         proc = self.login()
         self.assertIn("状态：成功", proc.stdout)
         self.assertNotIn("状态：失败", proc.stdout)
+        self.assert_notice_gone()
+
+    def test_legacy_hook_is_verified_replaced_and_cannot_consume_new_notice(self) -> None:
+        self.write_receipt(phase="configure", status="running", failed="yes")
+        self.install(kind="failure", stage="configure")
+        self.shell(r'''
+NV_NOTICE_APP=next-vps-setup
+nv_notice_paths
+nv_notice_load_existing
+nv_notice_render_hook 1 > "$NV_NOTICE_HOOK"
+''')
+        previous = self.root / "legacy-open-hook.sh"
+        previous.write_bytes(self.hook.read_bytes())
+        self.assertTrue(previous.read_bytes().startswith(b"# next-vps-ssh-notice 1\n"))
+        self.install(task=NEXT_TASK)
+        self.write_receipt(task=NEXT_TASK)
+        proc = self.login(body=f'source "{previous}"')
+        self.assertNotIn("已完成", proc.stdout)
+        self.assertTrue(self.hook.read_bytes().startswith(b"# next-vps-ssh-notice 2\n"))
+        self.assertIn("已完成", self.login().stdout)
         self.assert_notice_gone()
 
     def test_modified_hook_is_not_overwritten_by_another_installation(self) -> None:

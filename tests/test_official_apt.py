@@ -375,16 +375,16 @@ official_apt_cleanup
         self.assertTrue((self.view / "owner").exists())
         self.assertTrue((self.view / "official.sources").exists())
 
-    def test_find_failure_after_validation_does_not_delete_regular_files(self) -> None:
+    def test_cleanup_does_not_delete_unknown_files_created_after_validation(self) -> None:
         self.run_shell("official_apt_prepare")
         self.run_shell(r'''
-find() {
-    if [[ -e $FIXTURE_ROOT/find-called ]]; then return 73; fi
-    : > "$FIXTURE_ROOT/find-called"
-    command find "$@"
+official_apt_clear_partial_links() {
+    local late
+    late=$(official_apt_root)/archives/partial/late
+    mkdir -- "$late" && printf 'keep\n' > "$late/untouched"
 }
 if official_apt_cleanup; then exit 96; fi
-[[ -f $(official_apt_root)/owner && -f $(official_apt_root)/official.sources ]]
+[[ -f $(official_apt_root)/owner && -f $(official_apt_root)/archives/partial/late/untouched ]]
 ''')
 
     def test_private_archives_and_partial_downloads_are_cleaned_without_host_changes(self) -> None:

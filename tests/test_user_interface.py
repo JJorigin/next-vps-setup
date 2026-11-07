@@ -137,7 +137,7 @@ class UserInterfaceTests(unittest.TestCase):
             'nv_ui_launch "$1" "$2" "$3" "$4"',
             "系统初始化", "5–10", "/var/lib/setup-result.tsv", "/var/lib/setup/run.log",
         )
-        self.assertIn("下一次 root 交互式 SSH 登录", output)
+        self.assertIn("通过 SSH 直接登录 root（登录 Shell 为 Bash）", output)
         self.assertIn("显示一次后自动清理", output)
         self.assertIn("任务仍在执行时不会报成功", output)
         self.assertIn("如未看到登录提示", output)
@@ -179,8 +179,8 @@ class UserInterfaceTests(unittest.TestCase):
         reason = '配置冲突：$(touch stopped-marker) %s\\n'
         output = self.run_ui('nv_ui_stopped "$1"', reason)
         self.assertIn("操作已停止 · 本次任务尚未完成", output)
-        self.assertIn("保留下面的原因和任务日志", output)
-        self.assertIn("同一文件恢复", output)
+        self.assertIn("若已有任务记录", output)
+        self.assertIn("保留原脚本和日志", output)
         self.assertIn("原因：" + reason, output)
         self.assertFalse((self.root / "stopped-marker").exists())
 

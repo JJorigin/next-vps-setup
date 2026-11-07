@@ -1,19 +1,21 @@
 # next-vps-setup
 
-**V1.3 · 一键 VPS 初始化，适用于 Debian 13。**
+**V1.4 · 一键 VPS 初始化，适用于 Debian 13。**
 
 新装系统使用 `next-vps-setup.sh`；以后更新内核使用 `next-vps-kernel-update.sh`。
 
 两个工具都更新 Debian 官方内核，保留原来的 cloud／标准 amd64 系列，不更换第三方内核。任务使用独立的官方 APT 源和缓存，保留签名校验，不修改现有源文件。已安装的第三方软件仍需自行确认安全性和兼容性。
 
-**已经成功初始化的机器无需重跑初始化。旧版本任务尚未完成时，不要下载 V1.3 覆盖原脚本；先保留原文件和日志，处理原任务。**
+**已经成功初始化的机器无需重跑初始化。旧版本任务尚未完成时，请保留原脚本和日志，先处理原任务。**
 
 ## 使用要求
 
 - Debian 13、amd64、systemd 虚拟机，使用 root。
+- `/root` 由 root 独占访问，例如权限为 `0700`。
+- 使用 `initramfs-tools` 和 Debian 标准或 cloud 内核。
 - SSH 登录正常，商家防火墙已放行当前 SSH 端口。
 - 操作前备份重要数据，并确认能使用商家控制台。
-- 初始化只用于新装系统。不支持容器、NAT 外部端口映射、多 SSH 监听端口或已有自定义 Fail2ban 配置。
+- 初始化只用于新装系统。SSH 需由 `ssh.service` 在单一端口监听。已安装 Fail2ban、存在自定义 Fail2ban 配置、使用 `ssh.socket` 或通过 NAT 映射成不同端口的系统不适用。
 
 ## 首次初始化
 
@@ -29,21 +31,26 @@
 | 实际内存≤1GiB | 创建1GiB磁盘 Swap，`swappiness=10`、优先级10 |
 | 实际内存>1GiB | 不新建 Swap，不接管已有内存策略 |
 
-内存按 `MemTotal` 判断。低内存机器创建 Swap 要求本地可写 ext4；已有 Swap 或冲突配置时停止。初始根分区至少2GiB空闲、`/boot` 至少200MiB空闲、可用内存至少128MiB；Swap 所在分区还需容纳1GiB文件并保留1GiB余量。
+内存按 `MemTotal` 判断。低内存机器创建 Swap 需要本地可写的 ext4，已有 Swap 或冲突配置时会停止。开始前，根分区需至少 2GiB 空闲和 10,000 个空闲 inode，`/boot` 需至少 200MiB 空闲，可用内存需至少 128MiB。Swap 所在分区需能容纳 1GiB 文件并留出 1GiB 余量。
 
 ### 下载并运行
 
-新装的 Debian 可能缺少 `curl`。下面任选一整段执行，前两行通过当前系统的 APT 源安装下载工具和 HTTPS 验证所需的 CA 证书。
+新装的 Debian 可能缺少 `curl` 或 CA 证书。已有这两项时直接选择 GitHub 或 jsDelivr 下载。缺少时，如果当前系统的 APT 源可用且可信，先执行：
+
+```bash
+apt-get --error-on=any update &&
+apt-get install -y --no-install-recommends --no-remove curl ca-certificates
+```
+
+这一步使用系统现有软件源。若刷新失败或不想使用这些源，请走下方的本地上传方式。
 
 **任务进行期间不要替换脚本、重复启动任务或同时执行系统升级。**
 
 **GitHub 下载**
 
 ```bash
-apt-get --error-on=any update &&
-apt-get install -y --no-install-recommends --no-remove curl ca-certificates &&
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.3/next-vps-setup.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.4/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
@@ -53,20 +60,18 @@ bash /root/next-vps-setup.sh
 **jsDelivr 下载**
 
 ```bash
-apt-get --error-on=any update &&
-apt-get install -y --no-install-recommends --no-remove curl ca-certificates &&
 curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.3/next-vps-setup.sh \
+  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.4/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
 mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
 chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
-如果 VPS 暂时无法通过 APT 安装下载工具，可在本地下载本仓库的脚本，上传到 `/root/next-vps-setup.sh`，再执行下面两行。
+也可以从 [V1.4 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.4) 下载脚本，上传到 `/root/next-vps-setup.sh`，再执行以下命令。
 
 ```bash
-chmod 700 /root/next-vps-setup.sh
+chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
@@ -76,7 +81,7 @@ bash /root/next-vps-setup.sh
 
 输入机器名和当前 SSH 端口后，任务在后台继续，期间可能多次重启，SSH 会断开。**请先等待约5～10分钟，再手动连接 SSH**；下载或更新较慢时需要更久。
 
-任务成功或失败后，下次以 root 通过交互式 Bash SSH 登录会显示一次结果，随后自动清理通知文件。没有看到提示时查询：
+任务成功或失败后，下次通过 SSH 直接登录 root（登录 Shell 为 Bash）会显示一次结果，随后自动清理通知文件。没有看到提示时，可查询结果文件。
 
 ```bash
 cat /var/lib/next-vps-setup-result.tsv
@@ -94,7 +99,7 @@ cat /var/lib/next-vps-setup-result.tsv
 
 ```bash
 curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.3/next-vps-kernel-update.sh \
+  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.4/next-vps-kernel-update.sh \
   -o /root/next-vps-kernel-update.download &&
 mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -124,7 +129,11 @@ bash /root/next-vps-kernel-update.sh --resume
 
 初始化日志：`/var/lib/next-vps-setup/next-vps-setup.log`；内核维护日志：`/var/lib/next-vps-kernel-update/run.log`。
 
-V1.2 内核维护若提示 `Swap or swappiness did not persist.`，可能是旧版将 Swap 已用量计入比较造成误报。**保留原脚本、状态和日志，不要用 V1.3 覆盖，也不要为消除报错而关闭或重建 Swap。** 先确认实际原因，再处理原任务。V1.3 不会自动接管旧版未完成的任务。
+任务已提交但没有日志时，用 `journalctl -u next-vps-setup.service -n 80 --no-pager` 查看启动错误。内核维护请把服务名换成 `next-vps-kernel-update.service`。
+
+如果日志明确提示已请求重启、但启动尚未发生，先确认 APT 和任务已停止，再通过商家控制台重启。重连后若任务仍显示失败，使用原脚本恢复。
+
+V1.2 内核维护若提示 `Swap or swappiness did not persist.`，可能是旧版将 Swap 已用量计入比较造成误报。请保留原脚本、状态和日志，先确认实际原因。
 
 `cleanup_pending` 表示清理尚未完成。若入口已清理，需重新上传相同内容到原路径再恢复。
 
