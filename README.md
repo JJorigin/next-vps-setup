@@ -33,11 +33,15 @@
 
 ### 下载并运行
 
-以下方式任选一种。**任务进行期间不要替换脚本、重复启动任务或同时执行系统升级。**
+新装的 Debian 可能缺少 `curl`。下面任选一整段执行，前两行通过当前系统的 APT 源安装下载工具和 HTTPS 验证所需的 CA 证书。
 
-GitHub：
+**任务进行期间不要替换脚本、重复启动任务或同时执行系统升级。**
+
+**GitHub 下载**
 
 ```bash
+apt-get --error-on=any update &&
+apt-get install -y --no-install-recommends --no-remove curl ca-certificates &&
 curl -fL --retry 3 --connect-timeout 15 \
   https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.3/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
@@ -46,9 +50,11 @@ chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
-jsDelivr：
+**jsDelivr 下载**
 
 ```bash
+apt-get --error-on=any update &&
+apt-get install -y --no-install-recommends --no-remove curl ca-certificates &&
 curl -fL --retry 3 --connect-timeout 15 \
   https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.3/next-vps-setup.sh \
   -o /root/next-vps-setup.download &&
@@ -57,7 +63,7 @@ chmod 700 /root/next-vps-setup.sh &&
 bash /root/next-vps-setup.sh
 ```
 
-没有 `curl` 时，可下载本仓库的脚本，上传到 `/root/next-vps-setup.sh`，再执行：
+如果 VPS 暂时无法通过 APT 安装下载工具，可在本地下载本仓库的脚本，上传到 `/root/next-vps-setup.sh`，再执行下面两行。
 
 ```bash
 chmod 700 /root/next-vps-setup.sh
