@@ -87,6 +87,7 @@ cat() {
 }
 uname() { [[ ${1:-} == -r ]] || return 94; printf '6.12.113+deb13-cloud-amd64\n'; }
 safe_entry_path() { [[ $1 == /root/next-vps-setup.sh ]]; }
+safe_state_parent() { [[ $1 == "$FIXTURE_ROOT" || $1 == "$FIXTURE_ROOT"/* ]]; }
 file_sha() {
     if [[ $1 == /root/next-vps-setup.sh ]]; then sha256sum -- "$FIXTURE_ROOT/uploaded.sh" | awk '{print $1}'
     else sha256sum -- "$1" | awk '{print $1}'; fi
@@ -95,12 +96,19 @@ file_identity() {
     if [[ $1 == /root/next-vps-setup.sh ]]; then stat -c '%d:%i' -- "$FIXTURE_ROOT/uploaded.sh"
     else stat -c '%d:%i' -- "$1"; fi
 }
+mv() {
+    if [[ $# == 6 && $1 == -T && $2 == --no-copy && $3 == --update=none-fail && $4 == -- ]]; then
+        [[ $5 == "$FIXTURE_ROOT"/* && $6 == "$FIXTURE_ROOT"/* && ! -e $6 && ! -L $6 ]] || return 96
+        command mv -T -- "$5" "$6"
+    else command mv "$@"; fi
+}
 cp() {
     [[ $# == 3 && $1 == -- && $2 == /root/next-vps-setup.sh && $3 == "$BASE"/.bootstrap-worker.* ]] || return 95
     [[ -f $STATE_FILE && $(awk -F '\t' '$1=="task_id"{print $2}' "$STATE_FILE") == "${S[task_id]}" ]] || return 96
     /bin/cp -- "$FIXTURE_ROOT/uploaded.sh" "$3"
 }
 fresh_fail2ban_preflight() { :; }
+cloud-init() { [[ $1 == status ]] || return 1; printf 'status: disabled\n'; }
 check_ssh() { [[ $1 == 56789 ]]; }
 check_sources() { :; }
 check_resources() { :; }
@@ -168,6 +176,35 @@ prepare_bootstrap_recovery /root/next-vps-setup.sh
         self.assertEqual(self.read_state(self.result)["phase"], "swap")
         self.assertEqual(self.calls.read_text(), "LAUNCH\n")
 
+    def test_cloud_init_pending_or_error_stops_before_persisting_task(self) -> None:
+        for status, exit_code in (("not started", 0), ("running", 2), ("error", 1)):
+            with self.subTest(status=status):
+                proc = self.initialize(
+                    f"cloud-init() {{ printf 'status: {status}\\n'; return {exit_code}; }}",
+                    check=False,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("cloud-init", proc.stderr)
+                self.assertFalse(self.task.exists())
+                self.assertFalse(self.result.exists())
+
+    def test_effective_cloud_init_hosts_policy_takes_precedence_over_system_config(self) -> None:
+        fixture = r'''
+cloud-init() {
+    case $* in
+        'status --long') printf 'status: done\nextended_status: degraded done\n'; return 2 ;;
+        'query combined_cloud_config.manage_etc_hosts') printf '%s\n' "$EFFECTIVE" ;;
+        'query merged_system_cfg.manage_etc_hosts') printf '%s\n' "$SYSTEM" ;;
+        *) return 1 ;;
+    esac
+}
+cloud_init_preflight
+'''
+        proc = self.run_shell("EFFECTIVE=' yes '; SYSTEM=false\n" + fixture, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("/etc/hosts", proc.stderr)
+        self.run_shell("EFFECTIVE=false; SYSTEM=true\n" + fixture)
+
     def test_copy_failure_keeps_initial_state_without_partial_worker_and_resumes(self) -> None:
         proc = self.initialize('cp() { printf partial > "$3"; return 73; }', check=False)
         self.assertNotEqual(proc.returncode, 0)
@@ -212,12 +249,47 @@ prepare_bootstrap_recovery /root/next-vps-setup.sh
         self.assertFalse(stage.exists())
         self.assertEqual(self.read_state(self.state)["task_id"], TASK)
 
+    def test_partial_config_is_reused_and_leaves_no_staging_file(self) -> None:
+        self.initialize()
+        self.run_shell(r'''
+parse_state "$STATE_FILE"
+config=$FIXTURE_ROOT/new.conf
+stage=$FIXTURE_ROOT/.next-vps-setup-config.${S[task_id]}.new.conf
+printf 'sett' > "$stage"
+chmod 0600 "$stage"
+publish_config "$config" 'setting=1'
+[[ $(cat "$config") == 'setting=1' && ! -e $stage ]]
+''')
+
+    def test_final_index_loss_replans_without_recreating_swap(self) -> None:
+        self.initialize()
+        self.run_shell(r'''
+parse_state "$STATE_FILE"
+S[phase]=final; S[target_kernel]=6.12.113+deb13-cloud-amd64
+S[boot_before]=55555555-5555-4555-8555-555555555555
+S[reboot_count]=3; S[reboot_wait]=none; S[balloon]=module
+S[mem_kib]=524288; S[swap_policy]=disk1g; S[swap_uuid]=33333333-3333-4333-8333-333333333333
+S[swap_status]=active; S[swap_identity]=44444444-4444-4444-8444-444444444444:12345
+official_apt_ready() { return 0; }
+prepare_resume_plan
+[[ ${S[phase]} == final && ${S[reboot_count]} == 3 ]]
+official_apt_ready() { return 1; }
+prepare_resume_plan
+[[ ${S[phase]} == update && ${S[target_kernel]} == - && ${S[balloon]} == pending ]]
+[[ ${S[reboot_count]} == 0 && ${S[boot_before]} == - ]]
+[[ ${S[swap_status]} == active && ${S[swap_identity]} == 44444444-4444-4444-8444-444444444444:12345 ]]
+''')
+
     def test_swap_publishes_the_same_inode_after_interruption_before_rename(self) -> None:
         self.initialize()
         fixture = r'''
 parse_state "$STATE_FILE"
 SWAP_DIR=$FIXTURE_ROOT/final-swap
 SWAP_BYTES=1073741824
+swap_mount_field() {
+    [[ $1 == UUID ]] || return 97
+    printf '44444444-4444-4444-8444-444444444444\n'
+}
 '''
         before = self.run_shell(fixture + r'''
 S[mem_kib]=524288; S[swap_policy]=disk1g; S[swap_status]=building
@@ -234,7 +306,7 @@ publish_swap_directory
         self.assertNotEqual(before.returncode, 0)
         staged = self.task / "swap-staged" / "swapfile"
         inode = staged.stat().st_ino
-        self.assertEqual(self.read_state(self.state)["swap_identity"], f"{staged.stat().st_dev}:{inode}")
+        self.assertEqual(self.read_state(self.state)["swap_identity"], f"44444444-4444-4444-8444-444444444444:{inode}")
         self.run_shell(fixture + r'''
 mv() {
     if [[ ${!#} == "$SWAP_DIR" ]]; then
@@ -324,7 +396,7 @@ stat() {
         alias.symlink_to(parent, target_is_directory=True)
         self.assertNotEqual(self.run_shell(metadata + '\nsafe_state_parent "$FIXTURE_ROOT/parent-link/child"\n', check=False).returncode, 0)
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertLess(source.index("safe_state_parent /var/lib"), source.index("exec 9</var/lib"))
+        self.assertLess(source.index("safe_state_parent /var/lib"), source.index('nv_task_lock "$mode"'))
 
 
 if __name__ == "__main__":

@@ -163,7 +163,7 @@ class UserInterfaceTests(unittest.TestCase):
         log = '/tmp/log `touch log-marker`; $(reboot) %s\\n'
         title = '标题 $(touch title-marker) %s\\n'
         output = self.run_ui('nv_ui_launch "$1" "$2" "$3" "$4"', title, "3–10", receipt, log)
-        self.assertIn(title + " · 后台任务已启动", output)
+        self.assertIn(title + " · 后台任务已提交", output)
         self.assertIn("cat " + receipt, output)
         self.assertIn("tail -f " + log, output)
         for marker in ("receipt-marker", "log-marker", "title-marker"):

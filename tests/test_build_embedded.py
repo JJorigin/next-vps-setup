@@ -18,6 +18,7 @@ ENTRIES = ("next-vps-setup.sh", "next-vps-kernel-update.sh")
 MARKERS = (
     ("# BEGIN EMBEDDED user-interface", "# END EMBEDDED user-interface"),
     ("# BEGIN EMBEDDED ssh-notice", "# END EMBEDDED ssh-notice"),
+    ("# BEGIN EMBEDDED task-lock", "# END EMBEDDED task-lock"),
     ("# BEGIN NEXT-VPS OFFICIAL APT VIEW", "# END NEXT-VPS OFFICIAL APT VIEW"),
     ("# BEGIN EMBEDDED kernel-identity", "# END EMBEDDED kernel-identity"),
 )
@@ -40,9 +41,10 @@ class EmbeddedBuilderTests(unittest.TestCase):
             (self.root / name).with_suffix(".sha256").write_text("stale checksum\n", encoding="ascii", newline="\n")
         (self.root / "lib/user-interface.sh").write_text("# fresh UI\n", encoding="ascii", newline="\n")
         (self.root / "lib/ssh-notice.sh").write_text("# fresh notice\n", encoding="ascii", newline="\n")
+        (self.root / "lib/task-lock.sh").write_text("# fresh task lock\n", encoding="ascii", newline="\n")
         (self.root / "lib/kernel-identity.sh").write_text("# fresh kernel identity\n", encoding="ascii", newline="\n")
         (self.root / "lib/official-apt.sh").write_text(
-            MARKERS[2][0] + "\n# fresh APT\n" + MARKERS[2][1] + "\n", encoding="ascii", newline="\n"
+            MARKERS[3][0] + "\n# fresh APT\n" + MARKERS[3][1] + "\n", encoding="ascii", newline="\n"
         )
 
     def load_builder(self):
@@ -80,6 +82,7 @@ class EmbeddedBuilderTests(unittest.TestCase):
             payload = outputs[name]
             self.assertIn(b"# fresh UI\n", payload)
             self.assertIn(b"# fresh notice\n", payload)
+            self.assertIn(b"# fresh task lock\n", payload)
             self.assertIn(b"# fresh APT\n", payload)
             self.assertNotIn(b"stale embedded", payload)
             self.assertTrue(payload.endswith(b"# untouched tail\n"))
@@ -115,7 +118,7 @@ class EmbeddedBuilderTests(unittest.TestCase):
 
     def test_missing_helper_cannot_partially_write_outputs(self) -> None:
         builder = self.load_builder()
-        for name in ("user-interface", "ssh-notice", "official-apt", "kernel-identity"):
+        for name in ("user-interface", "ssh-notice", "task-lock", "official-apt", "kernel-identity"):
             with self.subTest(name=name):
                 path = self.root / "lib" / f"{name}.sh"
                 content = path.read_bytes()
@@ -155,7 +158,7 @@ class EmbeddedBuilderTests(unittest.TestCase):
 
     def test_interleaved_helper_blocks_are_rejected(self) -> None:
         builder = self.load_builder()
-        text = "#!/bin/bash\n" + "\n".join((MARKERS[0][0], MARKERS[1][0], MARKERS[0][1], MARKERS[1][1], *MARKERS[2])) + "\n"
+        text = "#!/bin/bash\n" + "\n".join((MARKERS[0][0], MARKERS[1][0], MARKERS[0][1], MARKERS[1][1], *(marker for pair in MARKERS[2:] for marker in pair))) + "\n"
         (self.root / ENTRIES[1]).write_text(text, encoding="utf-8", newline="\n")
         before = self.snapshot()
         with self.assertRaises(builder.BuildError):

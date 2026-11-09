@@ -18,6 +18,8 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "next-vps-kernel-update.sh"
+SCRIPT_VERSION = next(line.partition("=")[2] for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+                      if line.startswith("VERSION="))
 META = "linux-image-cloud-amd64"
 ABI = "6.12.115+deb13.1-cloud-amd64"
 TARGET = "linux-image-" + ABI
@@ -39,7 +41,7 @@ def inventory(*extra: str) -> str:
 
 def valid_state() -> dict[str, str]:
     return {
-        "format": "2", "version": "1.4", "task_id": BEFORE,
+        "format": "2", "version": SCRIPT_VERSION, "task_id": BEFORE,
         "machine_id": "a" * 32, "phase": "install", "failed": "no",
         "result_status": "running", "meta": META, "meta_version": "-",
         "target_pkg": "-", "target_abi": "-", "target_version": "-",
@@ -206,6 +208,25 @@ SYS_DIR=$FIXTURE_ROOT/sys
                 result = self.run_bash('select_old "$1" "$2" "$3" "$4"', META, TARGET, PKG_VERSION, inv, check=False)
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_inventory_preflight_rejects_installed_and_config_only_mixed_images(self) -> None:
+        command = 'select_old "$1" "" "" "$2" no no'
+        self.run_bash(command, META, inventory(row(OLD1, "6.12.107-1", "config-files")))
+        for status in ("installed", "config-files"):
+            with self.subTest(status=status):
+                inv = inventory(row("linux-image-6.12.107+deb13-amd64", "6.12.107-1", status))
+                self.assertNotEqual(self.run_bash(command, META, inv, check=False).returncode, 0)
+
+    def test_inventory_before_install_accepts_pending_target_but_not_equal_version_other_abi(self) -> None:
+        command = 'select_old "$1" "$2" "$3" "$4" no no'
+        for inv in (
+            "\n".join((row(META, "6.12.113-1"), row(OLD2, "6.12.113-1"))),
+            "\n".join((row(META, "6.12.115-1"), row(TARGET, "6.12.115-1"))),
+        ):
+            with self.subTest(inventory=inv):
+                self.run_bash(command, META, TARGET, PKG_VERSION, inv)
+        inv = inventory(row(OLD1, PKG_VERSION, "config-files"))
+        self.assertNotEqual(self.run_bash(command, META, TARGET, PKG_VERSION, inv, check=False).returncode, 0)
+
     def test_purge_plan_exact_expected_packages(self) -> None:
         expected = f"{OLD1}\n{OLD2}"
         plan = f"Reading package lists... Done\nPurg {OLD1} [6.12.107-1]\nPurg {OLD2}:amd64 [6.12.113-1]"
@@ -349,6 +370,7 @@ function /usr/sbin/sshd {
 }
 swap_hash() { printf 'fixture-swap\n'; }
 sysctl() { printf '10\n'; }
+nv_task_require_ssh_boot() { :; }
 systemctl() { return 0; }
 fail2ban-client() { return 0; }
 ssh_listening() { return 0; }
@@ -389,6 +411,58 @@ printf 'PRESERVED_OK\n'
         self.assertEqual(proc.returncode, 42, proc.stdout + proc.stderr)
         self.assertIn("无法完整读取持久配置", proc.stderr)
         self.assertNotIn("PRESERVED_OK", proc.stdout)
+
+    def test_ssh_boot_preflight_checks_persistent_target_socket_and_disable_marker(self) -> None:
+        body = r'''
+MOCK_SERVICE=$1 MOCK_DEFAULT=$2 MOCK_LINK=$3 MOCK_SOCKET=$4 MOCK_MARKER=${5:-no}
+unit_dir=$(mktemp -d "$FIXTURE_ROOT/systemd.XXXXXX")
+ssh_dir=$unit_dir/ssh
+mkdir -p "$unit_dir/multi-user.target.wants" "$ssh_dir"
+printf '[Unit]\n' > "$unit_dir/ssh.service"
+if [[ $MOCK_MARKER == yes ]]; then : > "$ssh_dir/sshd_not_to_be_run"; fi
+if [[ $MOCK_LINK == yes ]]; then
+    ln -s ../ssh.service "$unit_dir/multi-user.target.wants/ssh.service"
+fi
+systemctl() {
+    case $* in
+        'is-active --quiet ssh.service') return 0 ;;
+        'is-enabled ssh.service') printf '%s\n' "$MOCK_SERVICE"; [[ $MOCK_SERVICE != disabled ]] ;;
+        'get-default') printf '%s\n' "$MOCK_DEFAULT" ;;
+        'show ssh.service -p FragmentPath --value') printf '%s\n' "$unit_dir/ssh.service" ;;
+        'is-enabled ssh.socket') printf '%s\n' "$MOCK_SOCKET"; [[ $MOCK_SOCKET == enabled ]] ;;
+        'is-active --quiet ssh.socket') return 3 ;;
+        *) die 'Unexpected systemctl call.' ;;
+    esac
+}
+nv_task_require_ssh_boot "$unit_dir" "$ssh_dir"
+'''
+        self.run_bash(body, "enabled", "multi-user.target", "yes", "disabled")
+        for case in (
+            ("enabled-runtime", "multi-user.target", "yes", "disabled"),
+            ("disabled", "multi-user.target", "yes", "disabled"),
+            ("enabled", "rescue.target", "yes", "disabled"),
+            ("enabled", "multi-user.target", "no", "disabled"),
+            ("enabled", "multi-user.target", "yes", "enabled"),
+            ("enabled", "multi-user.target", "yes", "disabled", "yes"),
+        ):
+            with self.subTest(case=case):
+                proc = self.run_bash(body, *case, check=False)
+                self.assertNotEqual(proc.returncode, 0)
+
+    def test_post_boot_verification_keeps_approved_target_if_archive_advances(self) -> None:
+        body = assignments(self.purge_state()) + r'''
+boot_id() { printf '22222222-2222-4222-8222-222222222222\n'; }
+uname() { case $1 in -r) printf '%s\n' "${S[target_abi]}" ;; -v) printf 'fixture-build\n' ;; *) return 97 ;; esac; }
+plain_file() { [[ $1 == "$BOOT_DIR/vmlinuz-${S[target_abi]}" ]]; }
+nv_kernel_image_matches() { [[ $* == "$BOOT_DIR/vmlinuz-${S[target_abi]} ${S[target_abi]} fixture-build" ]]; }
+verify_installed_target() { printf 'local-target\n'; }
+strict_update() { die 'Verification unexpectedly requires a current index.'; }
+candidate() { printf '6.12.116-1\n'; }
+apt_run() { [[ $* == check ]] || die 'Unexpected APT command.'; printf 'apt-check\n'; }
+verify_preserved() { printf 'preserved\n'; }
+verify_target
+'''
+        self.assertEqual(self.run_bash(body).stdout.splitlines(), ["local-target", "apt-check", "preserved"])
 
     def test_config_hash_rejects_stat_failure_in_conditional_context(self) -> None:
         fixture = self.root / "etc/hostname"
@@ -702,25 +776,27 @@ resume_task /root/next-vps-kernel-update.sh
         self.assertFalse(self.calls.exists())
         self.assertEqual(destination.read_bytes(), before)
 
-    def test_resume_rejects_unfinished_13_task_without_changing_its_files(self) -> None:
+    def test_resume_rejects_unfinished_older_tasks_without_changing_their_files(self) -> None:
         destination, body = self.resume_fixture()
-        destination.write_text(
-            destination.read_text(encoding="utf-8").replace("format\t2\n", "format\t1\n")
-            .replace("version\t1.4\n", "version\t1.3\n").replace("purge_plan\t-\n", "")
-            .replace("reboot_retry\tno\n", ""),
-            encoding="utf-8", newline="\n",
-        )
-        before = {path.relative_to(self.root): path.read_bytes()
-                  for path in (self.root / "task").iterdir() if path.is_file()}
-        proc = self.run_bash(body + '\nresume_task /root/next-vps-kernel-update.sh\n', check=False)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Invalid existing state.", proc.stderr)
-        self.assertFalse(self.calls.exists())
-        self.assertFalse((self.root / "result.tsv").exists())
-        self.assertFalse((self.root / "unit.service").exists())
-        after = {path.relative_to(self.root): path.read_bytes()
-                 for path in (self.root / "task").iterdir() if path.is_file()}
-        self.assertEqual(after, before)
+        current = destination.read_text(encoding="utf-8")
+        for version in ("1.3", "1.4"):
+            with self.subTest(version=version):
+                old = current.replace(f"version\t{SCRIPT_VERSION}\n", f"version\t{version}\n")
+                if version == "1.3":
+                    old = (old.replace("format\t2\n", "format\t1\n").replace("purge_plan\t-\n", "")
+                           .replace("reboot_retry\tno\n", ""))
+                destination.write_text(old, encoding="utf-8", newline="\n")
+                before = {path.relative_to(self.root): path.read_bytes()
+                          for path in (self.root / "task").iterdir() if path.is_file()}
+                proc = self.run_bash(body + '\nresume_task /root/next-vps-kernel-update.sh\n', check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("Invalid existing state.", proc.stderr)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse((self.root / "result.tsv").exists())
+                self.assertFalse((self.root / "unit.service").exists())
+                after = {path.relative_to(self.root): path.read_bytes()
+                         for path in (self.root / "task").iterdir() if path.is_file()}
+                self.assertEqual(after, before)
 
     def test_cleanup_receipt_resume_rejects_unknown_residual(self) -> None:
         _, body = self.resume_fixture(cleanup_receipt=True, extra_residual=True)
@@ -777,8 +853,11 @@ launch() {
 '''
         return result_path, new_task, body
 
-    def test_prepare_publishes_new_running_receipt_before_launch(self) -> None:
+    def test_prepare_replaces_completed_14_receipt_before_launch(self) -> None:
         result_path, new_task, body = self.prepare_fixture()
+        previous = result_path.read_text(encoding="utf-8")
+        result_path.write_text(previous.replace(f"version\t{SCRIPT_VERSION}\n", "version\t1.4\n"),
+                               encoding="utf-8", newline="\n")
         body += "\nprepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64\n"
         self.run_bash(body)
         saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
@@ -788,11 +867,11 @@ launch() {
         self.assertEqual(saved["failed"], "no")
         self.assertEqual(self.calls.read_text(), f"launch:{new_task}\n")
 
-    def test_prepare_starts_new_14_task_after_completed_13_receipt(self) -> None:
+    def test_prepare_starts_new_task_after_completed_13_receipt(self) -> None:
         result_path, new_task, body = self.prepare_fixture()
         result_path.write_text(
             result_path.read_text(encoding="utf-8").replace("format\t2\n", "format\t1\n")
-            .replace("version\t1.4\n", "version\t1.3\n").replace("purge_plan\t-\n", "")
+            .replace(f"version\t{SCRIPT_VERSION}\n", "version\t1.3\n").replace("purge_plan\t-\n", "")
             .replace("reboot_retry\tno\n", ""),
             encoding="utf-8", newline="\n",
         )
@@ -802,7 +881,7 @@ launch() {
         self.run_bash(body + '\nprepare /root/next-vps-kernel-update.sh linux-image-cloud-amd64\n')
         saved = dict(line.split("\t", 1) for line in result_path.read_text().splitlines())
         state = dict(line.split("\t", 1) for line in (self.root / "task/state.tsv").read_text().splitlines())
-        self.assertEqual(saved["version"], "1.4")
+        self.assertEqual(saved["version"], SCRIPT_VERSION)
         self.assertEqual(saved["task_id"], new_task)
         self.assertNotEqual(saved["task_id"], old["task_id"])
         self.assertEqual(saved["phase"], "install")
@@ -967,7 +1046,9 @@ systemctl() {
     case "$*" in
         *'FragmentPath'*) printf '%s\n' "$UNIT_FILE" ;;
         *'DropInPaths'*) printf '\n' ;;
-        'start --no-block '*) return 41 ;;
+        'start --no-block '*)
+            if flock -n "$FIXTURE_ROOT" true; then return 96; fi
+            return 41 ;;
         *) return 0 ;;
     esac
 }

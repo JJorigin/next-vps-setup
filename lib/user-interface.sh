@@ -28,7 +28,7 @@ nv_ui_progress() {
 }
 nv_ui_launch() {
     local title=$1 minutes=$2 receipt=$3 log=$4
-    nv_ui_heading "$title · 后台任务已启动"
+    nv_ui_heading "$title · 后台任务已提交"
     printf '%s\n' \
         '  请留意：任务会自动重启，SSH 连接会断开。' \
         '  SSH 不会自动重连，需要使用原账号和端口手动连接。' \

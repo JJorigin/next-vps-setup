@@ -46,7 +46,7 @@ class OfficialAptSourceTests(unittest.TestCase):
                 source = script.read_text(encoding="utf-8")
                 self.assertNotIn("$(apt-cache ", source)
                 self.assertNotRegex(source, r"(?m)^\s+apt-get (?:clean|update|install|dist-upgrade)")
-                self.assertIn("official_apt_recover_indexes", source)
+                self.assertIn("official_apt_prepare && official_apt_exec", source)
                 self.assertIn("official_apt_cleanup", source)
 
 
@@ -104,9 +104,8 @@ class OfficialAptViewTests(unittest.TestCase):
         self.host_before = {p.name: p.read_bytes() for p in self.host.iterdir()}
 
     def run_shell(self, body: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        # Ownership is mapped only in the fixture's stat wrapper because a
-        # rootless test cannot manufacture UID-0 files. Permissions and file
-        # types are checked by the original production functions unchanged.
+        # Model ownership and credential changes without root. Real file
+        # types, permission bits and APT configuration are still checked.
         bootstrap = r'''
 set -Eeuo pipefail
 source "$OFFICIAL_APT_LIBRARY"
@@ -119,6 +118,32 @@ stat() {
         elif [[ ${!#} == "${FIXTURE_APT_OWNED_PATH:-}" ]]; then id -u _apt
         else printf '0\n'; fi
     else command stat "$@"; fi
+}
+setpriv() {
+    [[ $# == 8 && $1 == "--reuid=$(id -u _apt)" && $2 == "--regid=$(id -g _apt)" &&
+       $3 == --clear-groups && $4 == --inh-caps=-all && $5 == -- && $6 == /usr/bin/test ]] || return 97
+    [[ $8 != "${FIXTURE_SANDBOX_DENY_PATH:-}" ]] || return 1
+    shift 5
+    "$@"
+}
+chown() {
+    [[ $# == 4 && $1 == --no-dereference && $2 == "$(id -u _apt):0" && $3 == -- ]] || return 97
+    case $4 in "$BASE-apt/lists/partial"|"$BASE-apt/lists/auxfiles"|"$BASE-apt/archives/partial") return 0 ;; esac
+    return 97
+}
+mv() {
+    if [[ ${2:-} == --no-copy ]]; then
+        # Test hosts may have older coreutils. Exercise the exact Debian 13
+        # flags, then model the same-filesystem rename in the fixture.
+        [[ $# == 6 && $1 == -T && $3 == --update=none-fail && $4 == -- && ! -e $6 && ! -L $6 ]] || return 97
+        case $6 in
+            "$BASE-apt.cleanup-$TASK_ID") [[ $5 == "$BASE-apt" ]] || return 97 ;;
+            "$BASE-apt/owner"|"$BASE-apt/empty.conf"|"$BASE-apt/preferences"|"$BASE-apt/auth.conf"|"$BASE-apt/official.sources"|"$BASE-apt/apt.conf")
+                [[ $5 == "$BASE-apt/.${6##*/}.pending-$TASK_ID" ]] || return 97 ;;
+            *) return 97 ;;
+        esac
+        command mv -T -- "$5" "$6"
+    else command mv "$@"; fi
 }
 '''
         env = os.environ.copy()
@@ -220,6 +245,35 @@ official_apt_exec /usr/bin/env
         (self.view / "owner").unlink()
         proc = self.run_shell("official_apt_prepare", check=False)
         self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.view / "owner").exists())
+
+    def test_prepare_recovers_task_specific_interrupted_config_writes(self) -> None:
+        self.view.mkdir(mode=0o755)
+        owner_stage = self.view / f".owner.pending-{TASK}"
+        owner_stage.write_bytes(TASK[:12].encode())
+        owner_stage.chmod(0o600)
+        self.run_shell("official_apt_prepare")
+        self.assertEqual((self.view / "owner").read_text(), TASK + "\n")
+        self.assertFalse(owner_stage.exists())
+
+        conf = self.view / "apt.conf"
+        original = conf.read_bytes()
+        conf.unlink()
+        config_stage = self.view / f".apt.conf.pending-{TASK}"
+        config_stage.write_bytes(original[:32])
+        config_stage.chmod(0o600)
+        self.run_shell("official_apt_prepare; official_apt_exec apt-config dump")
+        self.assertEqual(conf.read_bytes(), original)
+        self.assertFalse(config_stage.exists())
+
+    def test_wrong_pending_owner_is_preserved_without_adopting_it(self) -> None:
+        self.view.mkdir(mode=0o755)
+        owner_stage = self.view / f".owner.pending-{TASK}"
+        owner_stage.write_text("foreign data\n")
+        owner_stage.chmod(0o600)
+        proc = self.run_shell("official_apt_prepare", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(owner_stage.read_text(), "foreign data\n")
         self.assertFalse((self.view / "owner").exists())
 
     def test_symlink_and_writable_private_config_are_rejected(self) -> None:
@@ -541,6 +595,56 @@ official_apt_prepare
         self.assertEqual((self.view / "owner").read_text(), TASK + "\n")
         self.assertTrue((self.view / "apt.conf").exists())
 
+    def test_cleanup_resumes_after_owner_was_removed_from_retired_directory(self) -> None:
+        self.run_shell("official_apt_prepare")
+        self.run_shell(r'''
+rmdir() {
+    [[ ${!#} != "$BASE-apt.cleanup-$TASK_ID" ]] || return 43
+    command rmdir "$@"
+}
+if official_apt_cleanup; then exit 96; fi
+''')
+        retired = Path(f"{self.view}.cleanup-{TASK}")
+        self.assertFalse(self.view.exists())
+        self.assertEqual(list(retired.iterdir()), [])
+        self.run_shell("official_apt_cleanup")
+        self.assertFalse(retired.exists())
+
+    def test_cleanup_refuses_unknown_content_in_retired_directory(self) -> None:
+        retired = Path(f"{self.view}.cleanup-{TASK}")
+        retired.mkdir(mode=0o755)
+        unknown = retired / "unexpected"
+        unknown.write_text("preserve me\n")
+        self.assertNotEqual(self.run_shell("official_apt_cleanup", check=False).returncode, 0)
+        self.assertEqual(unknown.read_text(), "preserve me\n")
+
+    def test_wrapper_rejects_unavailable_sandbox_before_running_apt(self) -> None:
+        proc = self.run_shell(r'''
+FIXTURE_SANDBOX_DENY_PATH="$BASE-apt/lists/partial"
+official_apt_exec() { printf 'UNEXPECTED_APT\n'; }
+apt_cache policy | cat
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("UNEXPECTED_APT", proc.stdout)
+
+    def test_wrapper_rejects_config_publish_failure_inside_pipeline(self) -> None:
+        proc = self.run_shell(r'''
+official_apt_publish() {
+    [[ $1 != "$BASE-apt/apt.conf" ]] || return 43
+    printf '%s' "$2" > "$1"
+}
+official_apt_exec() { printf 'UNEXPECTED_APT\n'; }
+apt_cache policy | cat
+''', check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("UNEXPECTED_APT", proc.stdout)
+        self.assertFalse((self.view / "apt.conf").exists())
+
+    def test_exec_refuses_missing_config_without_preparation(self) -> None:
+        proc = self.run_shell("official_apt_exec apt-config dump", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Dir::State", proc.stdout)
+
     def test_wrappers_use_only_private_config_and_do_not_invoke_host_apt(self) -> None:
         bindir = self.root / "bin"
         bindir.mkdir()
@@ -560,19 +664,11 @@ apt_cache policy synthetic-package
         self.assertIn("-s --no-remove install synthetic-package", proc.stdout)
         self.assertIn("policy synthetic-package", proc.stdout)
 
-    def test_recovery_refreshes_missing_indexes_only(self) -> None:
-        proc = self.run_shell(r'''
-official_apt_prepare
-strict_update() { printf 'REFRESH\n'; }
-official_apt_recover_indexes
-''')
-        self.assertIn("REFRESH", proc.stdout)
+    def test_index_readiness_requires_all_suites(self) -> None:
+        self.run_shell("official_apt_prepare")
+        self.assertNotEqual(self.run_shell("official_apt_ready", check=False).returncode, 0)
         self.complete_index_fixture()
-        proc = self.run_shell(r'''
-strict_update() { printf 'SHOULD_NOT_REFRESH\n'; return 91; }
-official_apt_recover_indexes
-''')
-        self.assertNotIn("SHOULD_NOT_REFRESH", proc.stdout)
+        self.run_shell("official_apt_ready")
 
     def complete_index_fixture(self) -> None:
         self.run_shell("official_apt_prepare")
@@ -580,17 +676,15 @@ official_apt_recover_indexes
             (self.view / "lists" / f"{prefix}_InRelease").write_text("synthetic index\n")
             (self.view / "lists" / f"{prefix}_main_binary-amd64_Packages.lz4").write_text("synthetic index\n")
 
-    def test_missing_updates_release_refreshes_even_when_other_suites_remain(self) -> None:
+    def test_missing_updates_release_is_not_ready_even_when_other_suites_remain(self) -> None:
         self.complete_index_fixture()
         (self.view / "lists" / f"{INDEX_PREFIXES[1]}_InRelease").unlink()
-        proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
-        self.assertIn("REFRESH", proc.stdout)
+        self.assertNotEqual(self.run_shell("official_apt_ready", check=False).returncode, 0)
 
-    def test_missing_updates_packages_refreshes_even_when_other_suites_remain(self) -> None:
+    def test_missing_updates_packages_are_not_ready_even_when_other_suites_remain(self) -> None:
         self.complete_index_fixture()
         (self.view / "lists" / f"{INDEX_PREFIXES[1]}_main_binary-amd64_Packages.lz4").unlink()
-        proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
-        self.assertIn("REFRESH", proc.stdout)
+        self.assertNotEqual(self.run_shell("official_apt_ready", check=False).returncode, 0)
 
     def test_release_declared_empty_packages_need_no_local_index_file(self) -> None:
         self.complete_index_fixture()
@@ -602,13 +696,12 @@ official_apt_recover_indexes
             " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n"
             "-----BEGIN PGP SIGNATURE-----\nsynthetic signature; readiness only\n"
         )
-        proc = self.run_shell("strict_update() { printf 'UNEXPECTED_REFRESH\\n'; return 91; }; official_apt_recover_indexes")
-        self.assertNotIn("UNEXPECTED_REFRESH", proc.stdout)
+        self.run_shell("official_apt_ready")
         # APT may also leave a zero-byte uncompressed copy; it is still empty.
         (self.view / "lists" / f"{prefix}_main_binary-amd64_Packages").touch()
         self.run_shell("official_apt_ready")
 
-    def test_zero_byte_index_without_matching_empty_sha256_requires_refresh(self) -> None:
+    def test_zero_byte_index_without_matching_empty_sha256_is_not_ready(self) -> None:
         self.complete_index_fixture()
         prefix = INDEX_PREFIXES[1]
         package = self.view / "lists" / f"{prefix}_main_binary-amd64_Packages.lz4"
@@ -625,8 +718,7 @@ official_apt_recover_indexes
         ):
             with self.subTest(release=text):
                 release.write_text(text)
-                proc = self.run_shell("strict_update() { printf 'REFRESH\\n'; }; official_apt_recover_indexes")
-                self.assertIn("REFRESH", proc.stdout)
+                self.assertNotEqual(self.run_shell("official_apt_ready", check=False).returncode, 0)
 
 
 if __name__ == "__main__":

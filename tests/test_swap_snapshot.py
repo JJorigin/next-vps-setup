@@ -238,6 +238,7 @@ sysctl() {
     printf '%s\n' "$CURRENT_SWAPPINESS"
     return "$CURRENT_SWAPPINESS_STATUS"
 }
+nv_task_require_ssh_boot() { :; }
 systemctl() {
     [[ $# == 3 && $1 == is-active && $2 == --quiet ]] || die 'Unexpected systemctl call.'
     case $3 in ssh.service|fail2ban.service|x-ui.service) return 0 ;; *) die 'Unexpected service.' ;; esac

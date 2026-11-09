@@ -17,6 +17,7 @@ ENTRIES = ("next-vps-setup.sh", "next-vps-kernel-update.sh")
 HELPERS = (
     ("user-interface", "lib/user-interface.sh", "# BEGIN EMBEDDED user-interface", "# END EMBEDDED user-interface"),
     ("ssh-notice", "lib/ssh-notice.sh", "# BEGIN EMBEDDED ssh-notice", "# END EMBEDDED ssh-notice"),
+    ("task-lock", "lib/task-lock.sh", "# BEGIN EMBEDDED task-lock", "# END EMBEDDED task-lock"),
     ("official-apt", "lib/official-apt.sh", "# BEGIN NEXT-VPS OFFICIAL APT VIEW", "# END NEXT-VPS OFFICIAL APT VIEW"),
     ("kernel-identity", "lib/kernel-identity.sh", "# BEGIN EMBEDDED kernel-identity", "# END EMBEDDED kernel-identity"),
 )

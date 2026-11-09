@@ -1,5 +1,5 @@
 #!/bin/bash
-# next-vps-setup v1.4 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v1.5 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
@@ -30,7 +30,7 @@ SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
 SWAP_BYTES=1073741824
 SWAP_RESERVE_KIB=1048576
-VERSION=1.4
+VERSION=1.5
 declare -A S=()
 IN_REBOOT=no
 BOOTSTRAP_BASE_ID=
@@ -68,7 +68,7 @@ nv_ui_progress() {
 }
 nv_ui_launch() {
     local title=$1 minutes=$2 receipt=$3 log=$4
-    nv_ui_heading "$title · 后台任务已启动"
+    nv_ui_heading "$title · 后台任务已提交"
     printf '%s\n' \
         '  请留意：任务会自动重启，SSH 连接会断开。' \
         '  SSH 不会自动重连，需要使用原账号和端口手动连接。' \
@@ -384,6 +384,63 @@ nv_notice_install() (
 )
 # END NEXT_VPS_SSH_NOTICE
 # END EMBEDDED ssh-notice
+# BEGIN EMBEDDED task-lock
+# Shared mutex for the two systemd tasks. The directory inode lasts until reboot.
+nv_task_lock() {
+    local mode=$1 lock=/run/next-vps-task.lock parent_mode
+    [[ -d /run && ! -L /run && $(stat -c %u -- /run) == 0 ]] || die '任务锁的上级目录不安全。'
+    parent_mode=$(stat -c %a -- /run) || die '无法检查任务锁的上级目录。'
+    [[ $parent_mode =~ ^[0-7]{3,4}$ ]] && (( (8#$parent_mode & 022) == 0 )) || die '任务锁的上级目录可被其他用户修改。'
+    if [[ ! -e $lock && ! -L $lock ]]; then
+        # A read-only check can proceed when there is no active mutex yet.
+        [[ $mode != --check ]] || return 0
+        mkdir -m 0700 -- "$lock" 2>/dev/null || [[ -d $lock ]] || die '无法创建运行时任务锁。'
+    fi
+    [[ -d $lock && ! -L $lock && $(stat -c '%u:%a' -- "$lock") == 0:700 ]] || die '运行时任务锁的归属或权限不安全。'
+    exec 9<"$lock" || die '无法打开运行时任务锁。'
+    case $mode in
+        --worker) flock -x -w 30 9 || die '后台服务未能取得任务锁。请查看 systemd 服务日志。' ;;
+        --check) flock -s -n 9 || die '当前有任务正在运行，请稍后再检查。' ;;
+        *) flock -x -n 9 || die '已有初始化或内核维护任务正在运行。' ;;
+    esac
+}
+
+nv_task_check_resume() {
+    local unit=$1 active
+    active=$(systemctl show "$unit" -p ActiveState --value) || die '无法确认后台服务是否已经停止。'
+    case $active in
+        inactive|failed) ;;
+        *) die '后台服务仍在处理当前任务，请查看状态，稍后再恢复。' ;;
+    esac
+}
+
+nv_task_show_unit_failure() {
+    local unit=$1
+    systemctl is-failed --quiet "$unit" || return 1
+    printf '结果：后台服务已失败。回执可能尚未更新，请查看服务日志。\n  journalctl -u %s -n 80 --no-pager\n' "$unit"
+}
+
+# Check the normal Debian SSH boot path without changing its configuration.
+nv_task_require_ssh_boot() {
+    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state
+    [[ ! -e $ssh_dir/sshd_not_to_be_run && ! -L $ssh_dir/sshd_not_to_be_run ]] ||
+        die 'Debian 的 SSH 禁用标记仍存在，自动重启后可能无法登录。'
+    systemctl is-active --quiet ssh.service || die 'ssh.service 当前未运行。'
+    state=$(systemctl is-enabled ssh.service) && [[ $state == enabled ]] || die 'ssh.service 未设置为开机启动。'
+    target=$(systemctl get-default) || die '无法读取 systemd 默认启动目标。'
+    [[ $target == multi-user.target || $target == graphical.target ]] || die '默认启动目标不支持自动重启验收。'
+    fragment=$(systemctl show ssh.service -p FragmentPath --value) || die '无法读取 SSH 服务单元路径。'
+    fragment=$(readlink -e -- "$fragment") || die '无法解析 SSH 服务单元路径。'
+    link=$unit_dir/multi-user.target.wants/ssh.service
+    [[ -L $link && $(readlink -e -- "$link") == "$fragment" ]] || die '缺少有效的 SSH 开机启动链接。'
+    socket_state=$(systemctl is-enabled ssh.socket 2>/dev/null) || true
+    if [[ -z $socket_state ]]; then
+        socket_state=$(systemctl show ssh.socket -p LoadState --value) || die '无法读取 ssh.socket 的状态。'
+    fi
+    case $socket_state in disabled|masked|not-found) ;; *) die 'ssh.socket 已启用或无法核验其启动状态。' ;; esac
+    if systemctl is-active --quiet ssh.socket; then die '此工具要求 ssh.service 直接监听 SSH 端口。'; fi
+}
+# END EMBEDDED task-lock
 
 die() { nv_ui_stopped "$*" >&2; exit 1; }
 note() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -484,7 +541,11 @@ validate_state_value() {
         swap_policy) [[ $value == skip || $value == disk1g ]] ;;
         mem_kib) [[ $value =~ ^[1-9][0-9]{0,14}$ ]] ;;
         swap_uuid) [[ $value == - ]] || validate_boot_id "$value" ;;
-        swap_identity) [[ $value == - || $value =~ ^[0-9]+:[0-9]+$ ]] ;;
+        swap_identity)
+            # Keep completed V1.4 receipts readable. New tasks record a
+            # filesystem UUID instead of a boot-dependent device number.
+            [[ $value == - || $value =~ ^[0-9]+:[0-9]+$ ]] ||
+                { [[ ${value##*:} =~ ^[1-9][0-9]*$ ]] && validate_boot_id "${value%:*}"; } ;;
         swap_status) [[ $value == pending || $value == building || $value == active || $value == verified || $value == skipped ]] ;;
         phase) [[ $value == update || $value == configure || $value == kernel || $value == balloon || $value == swap || $value == final || $value == cleanup || $value == "done" ]] ;;
         boot_before|verified_boot) [[ $value == - ]] || validate_boot_id "$value" ;;
@@ -521,7 +582,7 @@ validate_state() {
         [[ ${S[swap_status]} != skipped ]] || return 1
         if [[ ${S[swap_status]} != pending ]]; then validate_boot_id "${S[swap_uuid]}" || return 1; fi
         if [[ ${S[swap_status]} == active || ${S[swap_status]} == verified ]]; then
-            [[ ${S[swap_identity]} =~ ^[0-9]+:[0-9]+$ ]] || return 1
+            [[ ${S[swap_identity]} != - ]] || return 1
         fi
     fi
     if [[ ${S[reboot_wait]} != none ]]; then
@@ -611,8 +672,7 @@ ssh_policy_sha() {
 check_ssh() {
     local expected=$1 configured listeners policy_sha
     /usr/sbin/sshd -t || die 'Invalid SSH configuration.'
-    systemctl is-active --quiet ssh.service || die 'ssh.service is not active.'
-    if systemctl is-active --quiet ssh.socket; then die 'SSH socket activation is unsupported by this version; no SSH configuration was changed.'; fi
+    nv_task_require_ssh_boot
     configured=$(/usr/sbin/sshd -T | awk '$1=="port" {print $2}' | sort -u)
     [[ $configured == "$expected" ]] || die 'Expected port and SSH configuration disagree, or multiple ports are configured.'
     listeners=$(ss -H -lntp | awk '/"sshd"/ {n=split($4,a,":"); print a[n]}' | sort -u)
@@ -669,7 +729,27 @@ check_os() {
     local selections
     selections=$(dpkg --get-selections)
     if awk '$2=="hold"{found=1} END{exit !found}' <<< "$selections"; then die '发现锁定的软件包。请先确认锁定原因，本次没有解除限制。'; fi
-
+    hostnamectl --static >/dev/null && timedatectl show -p Timezone --value >/dev/null ||
+        die '无法读取主机名或时区。请先确认系统 D-Bus、systemd-hostnamed 和 systemd-timedated 可用。'
+}
+cloud_init_preflight() {
+    local status manage
+    if command -v cloud-init >/dev/null 2>&1; then
+        status=$(cloud-init status --long) || true
+        case ${status%%$'\n'*} in
+            'status: disabled') return 0 ;;
+            'status: done') ;;
+            'status: not started'|'status: running')
+                die 'cloud-init 尚未完成。请等待镜像初始化结束后再启动本工具。' ;;
+            *) die '无法确认 cloud-init 已正常完成。请先查看 cloud-init status --long。' ;;
+        esac
+        manage=$(cloud-init query combined_cloud_config.manage_etc_hosts 2>/dev/null) ||
+            manage=$(cloud-init query merged_system_cfg.manage_etc_hosts 2>/dev/null) ||
+            manage=$(cloud-init query merged_cfg.manage_etc_hosts 2>/dev/null) || manage=
+        if [[ ${manage,,} =~ ^[[:space:]]*(true|1|on|yes|template)[[:space:]]*$ ]]; then
+            die '此镜像由 cloud-init 在开机时重写 /etc/hosts。请先确认主机名及 hosts 的持久配置方式。'
+        fi
+    fi
 }
 # BEGIN NEXT-VPS OFFICIAL APT VIEW
 # This block is embedded unchanged in both standalone delivery scripts.
@@ -683,10 +763,16 @@ official_apt_file_ok() {
 official_apt_dir_ok() {
     local mode uid apt_uid
     [[ -d $1 && ! -L $1 ]] || return 1
-    mode=$(stat -c %a -- "$1"); uid=$(stat -c %u -- "$1") || return 1
+    mode=$(stat -c %a -- "$1") && uid=$(stat -c %u -- "$1") || return 1
     apt_uid=$(id -u _apt) || return 1
     [[ $uid == 0 || ( ${2:-root} == download && $uid == "$apt_uid" ) ]] || return 1
     if [[ ${2:-root} == download ]]; then [[ $mode == 755 || $mode == 700 ]]; else [[ $mode == 755 ]]; fi
+}
+official_apt_sandbox_test() {
+    local uid gid
+    uid=$(id -u _apt) && [[ $uid =~ ^[1-9][0-9]*$ ]] || return 1
+    gid=$(id -g _apt) && [[ $gid =~ ^[0-9]+$ ]] || return 1
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all -- /usr/bin/test "$@"
 }
 official_apt_keyring_target() {
     local keyring=/usr/share/keyrings/debian-archive-keyring.gpg target link
@@ -708,12 +794,17 @@ official_apt_keyring_target() {
     printf '%s\n' "$target"
 }
 check_sources() {
-    local keyring
+    local keyring root mode sandbox_uid
     # Host source files, pins and APT hooks are neither loaded nor changed.
-    id -u _apt >/dev/null 2>&1 || die '系统缺少 APT 下载沙箱用户，请先修复基础软件包。'
+    command -v setpriv >/dev/null || die '系统缺少 setpriv，无法核验 APT 下载沙箱。'
+    sandbox_uid=$(id -u _apt) && [[ $sandbox_uid =~ ^[1-9][0-9]*$ ]] || die '系统缺少有效的 APT 下载沙箱用户。'
     keyring=$(official_apt_keyring_target) || die 'Debian 官方密钥文件缺失、权限异常或链接目标不受支持，请保留 ls -l /usr/share/keyrings/debian-archive-keyring.* 的输出供排查。'
-    (( (8#$(stat -c %a -- "$keyring") & 004) != 0 )) || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查文件权限。'
+    mode=$(stat -c %a -- "$keyring") || die '无法读取 Debian 签名密钥权限。'
+    (( (8#$mode & 004) != 0 )) && official_apt_sandbox_test -r "$keyring" || die 'APT 下载沙箱无法读取 Debian 签名密钥，请检查用户和路径权限。'
     [[ $BASE =~ ^/[a-zA-Z0-9_./-]+$ ]] || die 'Unsafe private APT path.'
+    root=$(official_apt_root) || return 1
+    official_apt_dir_ok "${root%/*}" && official_apt_sandbox_test -x "${root%/*}" ||
+        die 'APT 下载沙箱无法访问暂存目录的父路径，请检查 /var/lib 及上级目录权限。'
 }
 official_apt_sources_content() {
     cat <<'OFFICIAL_SOURCES'
@@ -780,17 +871,24 @@ DPkg::Lock::Timeout "300";
 DPkg::Options { "--force-confold"; };
 OFFICIAL_CONFIG
 }
+official_apt_stage_path() { printf '%s/.%s.pending-%s\n' "${1%/*}" "${1##*/}" "${S[task_id]}"; }
 official_apt_publish() {
-    local path=$1 content=$2 tmp
+    local path=$1 content=$2 tmp mode bytes
+    tmp=$(official_apt_stage_path "$path") || return 1
+    if [[ -e $tmp || -L $tmp ]]; then
+        official_apt_file_ok "$tmp" || die '更新暂存文件的归属或类型不安全，已保留现场。'
+        mode=$(stat -c %a -- "$tmp") && bytes=$(stat -c %s -- "$tmp") || return 1
+        [[ $mode == 600 || $mode == 644 ]] && [[ $bytes =~ ^[0-9]+$ ]] &&
+            cmp -s -n "$bytes" -- "$tmp" <(printf '%s' "$content") || die '更新暂存文件与本任务配置不匹配，已保留现场。'
+    fi
     if [[ -e $path || -L $path ]]; then
         official_apt_file_ok "$path" && cmp -s "$path" <(printf '%s' "$content") || die '本次更新使用的官方源配置已被改动，已停止以避免使用未知配置。'
-        return
+        if [[ -e $tmp ]]; then rm -- "$tmp" && sync -f "${path%/*}" || return 1; fi
+        return 0
     fi
-    tmp=$(mktemp "${path%/*}/.official-apt.XXXXXX") || return 1
-    if ! printf '%s' "$content" > "$tmp" || ! chmod 0644 "$tmp" || ! sync -f "$tmp"; then
-        rm -- "$tmp" || true; return 1
-    fi
-    if ! mv -T -- "$tmp" "$path"; then rm -- "$tmp" || true; return 1; fi
+    if [[ ! -e $tmp ]]; then (umask 077; set -o noclobber; : > "$tmp") || return 1; fi
+    printf '%s' "$content" > "$tmp" && chmod 0644 "$tmp" && sync -f "$tmp" || return 1
+    mv -T --no-copy --update=none-fail -- "$tmp" "$path" || return 1
     sync -f "${path%/*}"
 }
 official_apt_index_name_ok() {
@@ -899,39 +997,62 @@ official_apt_check_tree() {
     fi
 }
 official_apt_prepare() {
-    local root directory content
-    check_sources
-    root=$(official_apt_root)
-    official_apt_dir_ok "${root%/*}" || die 'Unsafe private APT parent directory.'
+    local root directory content path mode access apt_uid owner owner_stage
+    local -a entries=()
+    check_sources || return 1
+    root=$(official_apt_root) || return 1
     [[ -n ${S[task_id]:-} && ${S[task_id]} =~ ^[a-f0-9-]{36}$ ]] || die 'A task identity is required for private APT.'
-    if [[ ! -e $root && ! -L $root ]]; then mkdir -m 0755 -- "$root"; fi
+    if [[ ! -e $root && ! -L $root ]]; then mkdir -m 0755 -- "$root" || die '无法创建更新暂存目录。'; fi
     official_apt_dir_ok "$root" || die '更新暂存目录的权限或类型不安全，已停止。'
     if [[ ! -e $root/owner && ! -L $root/owner ]]; then
-        [[ -z $(find -P "$root" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'Unowned private APT data exists.'
+        owner_stage=$(official_apt_stage_path "$root/owner") || return 1
+        official_apt_collect_paths "$root" entries || die '无法检查更新暂存目录。'
+        if [[ -n ${entries[0]:-} ]]; then
+            [[ ${#entries[@]} == 1 && ${entries[0]} == "$owner_stage" ]] || die '更新暂存目录含有无法确认归属的内容。'
+        fi
     fi
-    official_apt_publish "$root/owner" "${S[task_id]}"$'\n'
-    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial archives archives/partial; do
-        if [[ ! -e $root/$directory && ! -L $root/$directory ]]; then mkdir -m 0755 -- "$root/$directory"; fi
-        case $directory in lists/partial|archives/partial) official_apt_dir_ok "$root/$directory" download ;; *) official_apt_dir_ok "$root/$directory" ;; esac || die 'Unsafe private APT subdirectory.'
+    official_apt_publish "$root/owner" "${S[task_id]}"$'\n' || die '无法保存更新暂存目录归属。'
+    for directory in parts sourceparts preferencesparts trustedparts authparts lists lists/partial lists/auxfiles archives archives/partial; do
+        path=$root/$directory
+        mode=0755
+        access=root
+        [[ $directory != */partial ]] || mode=0700
+        case $directory in lists/partial|lists/auxfiles|archives/partial) access=download ;; esac
+        if [[ ! -e $path && ! -L $path ]]; then mkdir -m "$mode" -- "$path" || die "无法创建 APT 暂存子目录：$path"; fi
+        official_apt_dir_ok "$path" "$access" || die "APT 暂存子目录的权限或类型不安全：$path"
     done
-    official_apt_publish "$root/empty.conf" ''
-    official_apt_publish "$root/preferences" ''
-    official_apt_publish "$root/auth.conf" ''
-    content=$(official_apt_sources_content); official_apt_publish "$root/official.sources" "$content"$'\n'
-    content=$(official_apt_config_content); official_apt_publish "$root/apt.conf" "$content"$'\n'
+    official_apt_publish "$root/empty.conf" '' || die '无法保存 APT 暂存主配置。'
+    official_apt_publish "$root/preferences" '' || die '无法保存 APT 暂存优先级配置。'
+    official_apt_publish "$root/auth.conf" '' || die '无法保存 APT 暂存认证配置。'
+    content=$(official_apt_sources_content) && official_apt_publish "$root/official.sources" "$content"$'\n' ||
+        die '无法保存本次更新的官方源。'
+    content=$(official_apt_config_content) && official_apt_publish "$root/apt.conf" "$content"$'\n' ||
+        die '无法保存本次更新的 APT 配置。'
     official_apt_check_tree || die '更新暂存目录出现未知内容或权限变化，已停止，请保留现场检查。'
+    apt_uid=$(id -u _apt) && [[ $apt_uid =~ ^[1-9][0-9]*$ ]] || die '系统缺少有效的 APT 下载沙箱用户。'
+    for directory in lists/partial lists/auxfiles archives/partial; do
+        path=$root/$directory
+        owner=$(stat -c %u -- "$path") || die "无法读取 APT 下载目录归属：$path"
+        # APT uses _apt:root for its downloads. Check access before APT can
+        # silently fall back to downloading as root.
+        if [[ $owner == 0 ]]; then chown --no-dereference "$apt_uid:0" -- "$path" || die "无法设置 APT 下载目录归属：$path"; fi
+        official_apt_sandbox_test -x "$path" && official_apt_sandbox_test -w "$path" ||
+            die "APT 下载沙箱无法写入暂存目录：$path"
+    done
     official_apt_clear_partial_links || die '无法安全清理本次官方索引的中断链接，请保留现场检查。'
 }
 official_apt_exec() {
     local tool=$1 root; shift
-    root=$(official_apt_root)
+    root=$(official_apt_root) || return 1
+    official_apt_file_ok "$root/apt.conf" && cmp -s "$root/apt.conf" <(official_apt_config_content) ||
+        die '本次更新的 APT 配置缺失或已改变，已停止。'
     env -u APT_CONFIG -u DPKG_ROOT -u DPKG_ADMINDIR -u DPKG_FORCE -u DPKG_FRONTEND_LOCKED \
         -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
         APT_CONFIG="$root/apt.conf" DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_MODE=l \
         "$tool" "$@"
 }
-apt_run() { official_apt_prepare; official_apt_exec apt-get "$@"; }
-apt_cache() { official_apt_prepare; official_apt_exec apt-cache "$@"; }
+apt_run() { official_apt_prepare && official_apt_exec apt-get "$@"; }
+apt_cache() { official_apt_prepare && official_apt_exec apt-cache "$@"; }
 official_apt_empty_packages() {
     # APT omits Packages when the authenticated InRelease declares it empty.
     # This is a readiness check only; signature verification remains with APT.
@@ -959,38 +1080,49 @@ official_apt_ready() {
     done
 }
 check_origins() {
-    local output; output=$(apt_cache policy)
+    local output; output=$(apt_cache policy) || die '无法读取本次更新的软件源来源。'
     awk '/^[[:space:]]*release / {
         if($0~/a=now([,[:space:]]|$)/)next
         if($0!~/o=Debian(-Security)?([,[:space:]]|$)/ || $0!~/n=trixie(-updates|-security)?([,[:space:]]|$)/)bad=1
         n++
     } END{exit(bad||n==0)}' <<< "$output" || die '软件索引未通过 Debian 13 官方来源检查，已停止。'
 }
-strict_update() { official_apt_prepare; apt_run --error-on=any update; check_origins; }
-official_apt_recover_indexes() {
-    official_apt_prepare
-    if ! official_apt_ready; then strict_update; fi
-}
+strict_update() { apt_run --error-on=any update && check_origins; }
 official_apt_cleanup() {
-    local root owner path
+    local root retired path
     local -a paths=()
-    root=$(official_apt_root)
-    [[ -e $root || -L $root ]] || return 0
-    official_apt_dir_ok "${root%/*}" && official_apt_dir_ok "$root" && official_apt_file_ok "$root/owner" || die '更新暂存目录或归属记录不安全，未执行清理。'
-    owner=$(cat "$root/owner") || die '无法读取更新暂存目录的归属记录，未执行清理。'
-    [[ $owner == "${S[task_id]}" ]] || die '更新暂存目录不属于本次任务，未执行清理。'
-    official_apt_check_tree paths || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
-    official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
-    # Reuse the checked paths. Download users may write to partial directories
-    # but cannot replace the root-controlled parents of these flat paths.
-    for path in "${paths[@]}"; do
-        [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
-    done
-    for path in lists/partial lists/auxfiles lists archives/partial archives parts sourceparts preferencesparts trustedparts authparts; do
-        [[ ! -d $root/$path ]] || rmdir -- "$root/$path" || return 1
-    done
-    rm -- "$root/owner" || return 1
-    rmdir -- "$root" || return 1
+    root=$(official_apt_root) || return 1
+    [[ ${S[task_id]:-} =~ ^[a-f0-9-]{36}$ ]] || die '缺少可核验的任务编号，未执行更新暂存目录清理。'
+    retired=$root.cleanup-${S[task_id]}
+    [[ -e $root || -L $root || -e $retired || -L $retired ]] || return 0
+    official_apt_dir_ok "${root%/*}" || die '更新暂存目录父路径不安全，未执行清理。'
+    if [[ -e $root || -L $root ]]; then
+        [[ ! -e $retired && ! -L $retired ]] || die '发现两个更新暂存目录，未执行清理。'
+        official_apt_dir_ok "$root" && official_apt_file_ok "$root/owner" || die '更新暂存目录或归属记录不安全，未执行清理。'
+        cmp -s "$root/owner" <(printf '%s\n' "${S[task_id]}") || die '更新暂存目录不属于本次任务，未执行清理。'
+        official_apt_check_tree paths || die '更新暂存目录含有未知内容，未执行清理，请保留现场检查。'
+        official_apt_clear_partial_links || die '本次官方索引的中断链接未能安全清理，未继续删除。'
+        # Reuse the checked paths. Download users may write to partial
+        # directories but cannot replace the root-controlled parents.
+        for path in "${paths[@]}"; do
+            [[ ! -f $path || -L $path || $path == "$root/owner" ]] || rm -- "$path" || return 1
+        done
+        for path in lists/partial lists/auxfiles lists archives/partial archives parts sourceparts preferencesparts trustedparts authparts; do
+            [[ ! -d $root/$path ]] || rmdir -- "$root/$path" || return 1
+        done
+        # Keep the owner until the verified directory is retired under this
+        # task ID. After that rename, an empty retired directory is resumable.
+        mv -T --no-copy --update=none-fail -- "$root" "$retired" || return 1
+        sync -f "${root%/*}" || return 1
+    fi
+    official_apt_dir_ok "$retired" && official_apt_collect_paths "$retired" paths || die '待移除的更新暂存目录不安全，未执行清理。'
+    if [[ -n ${paths[0]:-} ]]; then
+        [[ ${#paths[@]} == 1 && ${paths[0]} == "$retired/owner" ]] && official_apt_file_ok "$retired/owner" ||
+            die '待移除的更新暂存目录包含未知内容，未执行清理。'
+        cmp -s "$retired/owner" <(printf '%s\n' "${S[task_id]}") || die '待移除的更新暂存目录不属于本次任务。'
+        rm -- "$retired/owner" || return 1
+    fi
+    rmdir -- "$retired" || return 1
     sync -f "${root%/*}"
 }
 # END NEXT-VPS OFFICIAL APT VIEW
@@ -1113,11 +1245,18 @@ swap_mount_field() {
     printf '%s\n' "$value"
 }
 swap_filesystem_check() {
-    local source options
+    local source options uuid
     safe_swap_dir /var/lib && safe_swap_dir /etc/systemd/system && safe_swap_dir /etc/sysctl.d || die 'Unsafe disk Swap configuration directories.'
     [[ $(swap_mount_field FSTYPE) == ext4 ]] || die 'Automatic Swap creation supports a writable local ext4 filesystem only; no filesystem was changed.'
     source=$(swap_mount_field SOURCE); options=$(swap_mount_field OPTIONS)
     [[ $source == /dev/* && -b $source && ,$options, != *,ro,* ]] || die 'Expected a writable local ext4 block filesystem for Swap.'
+    uuid=$(swap_mount_field UUID) && validate_boot_id "$uuid" || die 'The Swap filesystem must have a readable ext4 UUID.'
+}
+swap_file_identity() {
+    local file=$1 uuid inode
+    uuid=$(swap_mount_field UUID) && validate_boot_id "$uuid" || return 1
+    inode=$(stat -c %i -- "$file") && [[ $inode =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s:%s\n' "$uuid" "$inode"
 }
 swap_no_conflicts() {
     local mode=$1 listing file value status unit load active sub rest what
@@ -1177,7 +1316,7 @@ swap_preflight() {
         if [[ -e $SWAP_UNIT_FILE || -L $SWAP_UNIT_FILE ]]; then plain_root_file "$SWAP_UNIT_FILE" && cmp -s "$SWAP_UNIT_FILE" <(swap_unit_content) || die 'Existing disk Swap unit conflicts.'; fi
     fi
     if [[ -e $SWAP_FILE || -L $SWAP_FILE ]]; then
-        plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]:--} != - && $(file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 ]] || die 'An unrecorded or changed partial Swap file remains; retain it for inspection.'
+        plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]:--} != - && $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 ]] || die 'An unrecorded or changed partial Swap file remains; retain it for inspection.'
         allocated=$(stat -c %b -- "$SWAP_FILE"); allocated=$((allocated*512))
     fi
     free=$(df -Pk /var/lib | awk 'END{print $4}')
@@ -1186,7 +1325,7 @@ swap_preflight() {
 swap_verify_file() {
     local blocks
     swap_inspect_owned
-    plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]} != - && $(file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") == "$SWAP_BYTES" ]] || die 'Owned Swap identity, size or permissions changed.'
+    plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]} != - && $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") == "$SWAP_BYTES" ]] || die 'Owned Swap identity, size or permissions changed.'
     blocks=$(stat -c %b -- "$SWAP_FILE")
     [[ $blocks =~ ^[0-9]+$ ]] && ((blocks*512>=SWAP_BYTES)) || die 'Swap allocation is incomplete or sparse.'
     [[ $(blkid -p -s TYPE -o value -- "$SWAP_FILE") == swap && $(blkid -p -s UUID -o value -- "$SWAP_FILE") == "${S[swap_uuid]}" ]] || die 'Owned Swap signature differs.'
@@ -1221,7 +1360,7 @@ publish_swap_directory() {
         (umask 077; set -o noclobber; : > "$file")
     fi
     [[ $(stat -c %a -- "$file") == 600 && $(stat -c %s -- "$file") == 0 ]] || die 'Unexpected staged Swap file mode or size.'
-    identity=$(file_identity "$file")
+    identity=$(swap_file_identity "$file") || die 'Cannot identify the staged Swap file.'
     if [[ ${S[swap_identity]} == - ]]; then
         sync -f "$stage"
         S[swap_identity]=$identity; save_state
@@ -1274,7 +1413,7 @@ phase_swap() {
     if [[ $active == yes ]]; then
         swap_verify_file
     else
-        plain_root_file "$SWAP_FILE" && [[ $(file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") -le $SWAP_BYTES ]] || die 'Partial Swap identity differs.'
+        plain_root_file "$SWAP_FILE" && [[ $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") -le $SWAP_BYTES ]] || die 'Partial Swap identity differs.'
         # Never overwrite an active Swap. Recheck immediately before construction.
         awk -v file="$SWAP_FILE" 'NR>1 && $1==file{bad=1} END{exit bad}' /proc/swaps || die 'Swap became active during construction.'
         dd if=/dev/zero of="$SWAP_FILE" bs=1048576 count=1024 conv=fsync status=progress
@@ -1302,17 +1441,29 @@ phase_update() {
     S[phase]=configure; save_state
 }
 publish_config() {
-    local path=$1 content=$2 parent=${1%/*} tmp
-    [[ -d $parent && ! -L $parent ]] || mkdir -p -- "$parent"
-    [[ ! -L $parent && ! -L $path ]] || die "Configuration symlink refused: $path"
+    local path=$1 content=$2 parent=${1%/*} ancestor tmp bytes
+    ancestor=$parent
+    while [[ ! -e $ancestor && ! -L $ancestor ]]; do
+        ancestor=${ancestor%/*}; [[ -n $ancestor ]] || ancestor=/
+    done
+    safe_state_parent "$ancestor" || die "Unsafe configuration directory: $ancestor"
+    if [[ $ancestor != "$parent" ]]; then mkdir -p -- "$parent"; fi
+    safe_state_parent "$parent" && [[ ! -L $path ]] || die "Unsafe configuration path: $path"
+    tmp=$parent/.next-vps-setup-config.${S[task_id]}.${path##*/}
+    if [[ -e $tmp || -L $tmp ]]; then
+        plain_root_file "$tmp" && [[ $(stat -c %h -- "$tmp") == 1 ]] || die "Unsafe staged configuration: $tmp"
+        bytes=$(stat -c %s -- "$tmp") || die "Cannot inspect staged configuration: $tmp"
+        cmp -s -n "$bytes" -- "$tmp" <(printf '%s\n' "$content") || die "Unknown staged configuration: $tmp"
+    fi
     if [[ -e $path ]]; then
         plain_root_file "$path" && cmp -s -- "$path" <(printf '%s\n' "$content") || die "Existing conflicting configuration: $path"
+        if [[ -e $tmp ]]; then rm -- "$tmp"; sync -f "$parent"; fi
         return 0
     fi
-    tmp=$(mktemp "$parent/.next-vps-setup-config.XXXXXX")
+    if [[ ! -e $tmp ]]; then (umask 077; set -o noclobber; : > "$tmp"); fi
     printf '%s\n' "$content" > "$tmp"; chmod 0644 "$tmp"; sync -f "$tmp"
-    ln -T -- "$tmp" "$path" || die "Cannot publish configuration: $path"
-    rm -- "$tmp"; sync -f "$parent"
+    mv -T --no-copy --update=none-fail -- "$tmp" "$path" || die "Cannot publish configuration without overwriting its destination: $path"
+    sync -f "$parent"
     [[ $path == "$UNIT_FILE" ]] || dirty
 }
 jail_content() {
@@ -1334,15 +1485,26 @@ JAIL_BODY
 }
 balloon_content() { printf '%s\n' '# Managed by next-vps-setup v1.3' 'blacklist virtio_balloon' 'install virtio_balloon /bin/false'; }
 configure_hostname() {
+    local hosts=/etc/hosts tmp=/etc/.next-vps-setup-hosts.${S[task_id]} bytes before current
     if [[ $(hostnamectl --static) != "${S[hostname]}" ]]; then hostnamectl set-hostname "${S[hostname]}"; dirty; fi
+    if [[ -e $tmp || -L $tmp ]]; then
+        safe_state_parent /etc && plain_root_file "$hosts" && plain_root_file "$tmp" &&
+            [[ $(stat -c %h -- "$tmp") == 1 ]] || die '已有的 hosts 暂存文件无法安全核验。'
+        bytes=$(stat -c %s -- "$tmp") || die '无法读取 hosts 暂存文件。'
+        cmp -s -n "$bytes" -- "$tmp" <(cat -- "$hosts" && printf '\n127.0.1.1\t%s\n' "${S[hostname]}") ||
+            die 'hosts 暂存文件与当前内容冲突，请保留现场检查。'
+        rm -- "$tmp"; sync -f /etc
+    fi
     if ! getent hosts "${S[hostname]}" >/dev/null; then
-        [[ -f /etc/hosts && ! -L /etc/hosts ]] || die 'Cannot safely update local hosts mapping.'
-        local tmp
-        tmp=$(mktemp /etc/.next-vps-setup-hosts.XXXXXX)
-        cat /etc/hosts > "$tmp"
+        safe_state_parent /etc && plain_root_file "$hosts" || die '无法安全更新本地主机名记录。'
+        before=$(file_sha "$hosts") || die '无法读取原有 hosts 文件。'
+        (umask 077; set -o noclobber; : > "$tmp") || die '无法创建 hosts 暂存文件。'
+        cat -- "$hosts" > "$tmp"
         printf '\n127.0.1.1\t%s\n' "${S[hostname]}" >> "$tmp"
-        chmod --reference=/etc/hosts "$tmp"; chown --reference=/etc/hosts "$tmp"
-        sync -f "$tmp"; mv -T -- "$tmp" /etc/hosts; sync -f /etc; dirty
+        chmod --reference="$hosts" "$tmp"; chown --reference="$hosts" "$tmp"
+        sync -f "$tmp"
+        plain_root_file "$hosts" && current=$(file_sha "$hosts") && [[ $current == "$before" ]] || die 'hosts 在更新期间发生变化，已保留原文件。'
+        mv -T --no-copy -- "$tmp" "$hosts"; sync -f /etc; dirty
     fi
     [[ $(hostnamectl --static) == "${S[hostname]}" ]] && getent hosts "${S[hostname]}" >/dev/null || die 'Hostname verification failed.'
 }
@@ -1455,6 +1617,7 @@ request_reboot() {
     submit_reboot
 }
 submit_reboot() {
+    check_ssh "${S[ssh_port]}"
     IN_REBOOT=yes
     if ! systemctl reboot --no-block; then
         IN_REBOOT=no
@@ -1518,7 +1681,6 @@ verify_configuration() {
     fi
 }
 verify_all() {
-    official_apt_recover_indexes
     verify_configuration
     check_candidate "${S[kernel_meta]}"; check_candidate "linux-image-${S[target_kernel]}"
     local pkg pending
@@ -1543,12 +1705,26 @@ snapshot_result() {
     S[verified_boot]=$(boot_id); S[verified_at]=$(date +%s)
 }
 phase_final() {
+    official_apt_prepare
+    official_apt_ready || die 'The original official APT indexes are unavailable. Use --resume to repeat the update and recheck the selected kernel.'
     if [[ ${S[last_config_boot]} == "$(boot_id)" ]]; then request_reboot final; fi
     verify_all
     if [[ ${S[swap_policy]} == disk1g ]]; then S[swap_status]=verified; fi
     snapshot_result
     S[phase]=cleanup; S[result_status]=cleanup_pending
     save_state; write_state_to "$RESULT"
+}
+prepare_resume_plan() {
+    if [[ ${S[phase]} == configure ]]; then
+        # Refresh and select the target together after an interrupted setup.
+        S[phase]=update
+    elif [[ ${S[phase]} == final && ${S[reboot_wait]} == none ]] && ! official_apt_ready; then
+        # The approved index snapshot was lost. Start a new verification plan
+        # without recreating Swap or replacing existing configuration.
+        S[phase]=update; S[target_kernel]=-; S[balloon]=pending
+        S[boot_before]=-; S[reboot_count]=0
+        note '原软件索引不完整。将重新读取 Debian 官方索引、选择内核并执行重启验收。'
+    fi
 }
 verify_task_files() {
     [[ -d $BASE && ! -L $BASE && $(stat -c %u "$BASE") == 0 && $(stat -c %a "$BASE") == 700 ]] || die 'Task directory is unsafe.'
@@ -1566,8 +1742,6 @@ verify_task_files() {
     done
 }
 cleanup_success() {
-    # The flock is on the existing /var/lib directory, never a deleted lock inode.
-    # It does not interfere with ordinary directory access or APT's different locks.
     [[ ${S[result_status]} == cleanup_pending ]] || die 'Cleanup lacks a verified receipt.'
     verify_configuration; snapshot_result verify; verify_task_files
     write_state_to "$RESULT"
@@ -1676,6 +1850,7 @@ print_status() {
         printf '  tail -n 100 %s/next-vps-setup.log\n' "$BASE"
     elif [[ ${S[result_status]} == complete ]]; then
         printf '%s\n' '结果：初始化完成，重启核验通过。'
+    elif nv_task_show_unit_failure "$UNIT"; then :
     elif [[ ${S[result_status]} == cleanup_pending ]]; then
         printf '%s\n' '结果：配置核验通过，任务文件尚未清理完成。请使用同一版本 --resume。'
     else printf '%s\n' '结果：尚未完成。后台可能仍在执行，请查看日志。'; fi
@@ -1705,9 +1880,9 @@ launch_worker() {
             submit_reboot
         fi
     fi
+    systemctl start --no-block "$UNIT" || die 'Cannot submit the initialization start request.'
     flock -u 9 || die 'Cannot release the initialization handoff lock.'
     exec 9<&- || die 'Cannot close the initialization handoff lock.'
-    systemctl start --no-block "$UNIT" || die 'Cannot submit the initialization start request.'
     trap - ERR EXIT TERM HUP INT
     nv_ui_launch "next-vps-setup $VERSION" '5–10' "$RESULT" "$BASE/next-vps-setup.log"
 }
@@ -1831,6 +2006,7 @@ initialize_task() {
     [[ ! -e $apt_root && ! -L $apt_root ]] || die 'An existing private APT directory requires inspection; it was not changed.'
     [[ ! -e $JAIL && ! -L $JAIL && ! -e $BALLOON_CONF && ! -L $BALLOON_CONF ]] || die 'Existing initialization configuration found; this entry is for a fresh system.'
     fresh_fail2ban_preflight
+    cloud_init_preflight
     [[ -t 0 ]] || die 'First run requires an interactive terminal.'
     nv_ui_heading "next-vps-setup $VERSION · Debian 13 初始化"
     printf '%s\n\n' '将更新官方软件包、配置基础防护，并自动重启验收。' 'SSH 账号、密码、端口和认证方式保持现有配置。' '网络校时不可用时会提醒并继续。请先确认备份和商家控制台可用。'
@@ -1881,11 +2057,10 @@ main() {
         print_status; return 0
     fi
     if [[ $mode != --worker ]]; then check_os; fi
-    # Directory inode is stable; no temporary lock file survives or is unlinked.
     safe_state_parent /var/lib || die 'Unsafe state parent directory; ownership or permissions require inspection.'
-    exec 9</var/lib
-    flock -n 9 || die 'Another initialization process is running.'
+    nv_task_lock "$mode"
     if [[ $mode == --worker ]]; then worker_main; return; fi
+    if [[ $mode == --resume && -e $UNIT_FILE ]]; then nv_task_check_resume "$UNIT"; fi
     entry=$(readlink -e -- "$0") || die 'Execute a regular local file, not stdin or a pipe.'
     if [[ -e $STATE_FILE || -L $STATE_FILE ]]; then
         plain_root_file "$STATE_FILE" && parse_state "$STATE_FILE" || die 'Unsupported or invalid task state; this version cannot resume a different release. No state was changed.'
@@ -1897,9 +2072,7 @@ main() {
             if bootstrap_pending; then prepare_bootstrap_recovery "$entry"; return 0; fi
             verify_task_files
             S[entry_identity]=$(file_identity "$entry"); S[entry_sha]=$(file_sha "$entry")
-            # Configuration may be retried long after its original packages
-            # disappeared from the mirror. Refresh and replan together.
-            if [[ ${S[phase]} == configure ]]; then S[phase]=update; fi
+            prepare_resume_plan
             S[failed]=no; save_state
             [[ -e $UNIT_FILE ]] || publish_config "$UNIT_FILE" "$(unit_content)"
             launch_worker

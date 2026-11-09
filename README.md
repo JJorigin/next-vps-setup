@@ -1,6 +1,6 @@
 # next-vps-setup
 
-**V1.4 · 一键 VPS 初始化，适用于 Debian 13。**
+**V1.5 · 一键 VPS 初始化，适用于 Debian 13。**
 
 新装系统使用 `next-vps-setup.sh`；以后更新内核使用 `next-vps-kernel-update.sh`。
 
@@ -13,9 +13,12 @@
 - Debian 13、amd64、systemd 虚拟机，使用 root。
 - `/root` 由 root 独占访问，例如权限为 `0700`。
 - 使用 `initramfs-tools` 和 Debian 标准或 cloud 内核。
-- SSH 登录正常，商家防火墙已放行当前 SSH 端口。
+- SSH 登录正常，`ssh.service` 随 `multi-user.target` 开机启动，默认启动目标为 `multi-user.target` 或 `graphical.target`。商家防火墙需放行当前 SSH 端口。
+- 系统 D-Bus 正常，`hostnamectl --static` 和 `timedatectl show -p Timezone --value` 可以正常查询。
+- VPS 可直连 `deb.debian.org` 和 `security.debian.org` 的 TCP 80 出站端口。脚本使用独立的官方 APT 源和签名校验，不继承系统代理。
 - 操作前备份重要数据，并确认能使用商家控制台。
-- 初始化只用于新装系统。SSH 需由 `ssh.service` 在单一端口监听。已安装 Fail2ban、存在自定义 Fail2ban 配置、使用 `ssh.socket` 或通过 NAT 映射成不同端口的系统不适用。
+- 初始化只用于新装系统，首次运行需交互终端。SSH 需由 `ssh.service` 在单一端口监听。已安装 Fail2ban、存在自定义 Fail2ban 配置、使用 `ssh.socket` 或通过 NAT 映射成不同端口的系统不适用。
+- 有 cloud-init 的镜像应先完成首次启动。若镜像会在每次开机时重写 `/etc/hosts`，需先确认主机名持久化方式。
 
 ## 首次初始化
 
@@ -27,7 +30,7 @@
 | 时区 | 马来西亚 `Asia/Kuala_Lumpur`，UTC+8 |
 | 时间同步 | 尽力启用，无法同步时提醒并继续 |
 | SSH 防护 | Fail2ban：同一来源10分钟内匹配5次失败事件，永久封禁 |
-| 气球驱动 | 禁止模块式驱动加载并重启检查；无法处理内建驱动时停止 |
+| 气球驱动 | 禁止模块式 `virtio_balloon` 加载并重启检查，发现内建的 `virtio_balloon` 时停止 |
 | 实际内存≤1GiB | 创建1GiB磁盘 Swap，`swappiness=10`、优先级10 |
 | 实际内存>1GiB | 不新建 Swap，不接管已有内存策略 |
 
@@ -44,31 +47,37 @@ apt-get install -y --no-install-recommends --no-remove curl ca-certificates
 
 这一步使用系统现有软件源。若刷新失败或不想使用这些源，请走下方的本地上传方式。
 
-**任务进行期间不要替换脚本、重复启动任务或同时执行系统升级。**
+**任务进行期间请用原文件查看状态。下载命令会保留同路径下已有的脚本。请等本机其他 APT 操作完成再启动任务。**
 
 **GitHub 下载**
 
 ```bash
-curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.4/next-vps-setup.sh \
-  -o /root/next-vps-setup.download &&
-mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
-chmod 700 /root/next-vps-setup.sh &&
+(
+  tmp=$(mktemp /root/.next-vps-setup.XXXXXX) || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  curl -fL --retry 3 --connect-timeout 15 \
+    https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.5/next-vps-setup.sh -o "$tmp" &&
+  chmod 700 "$tmp" &&
+  mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-setup.sh
+) &&
 bash /root/next-vps-setup.sh
 ```
 
 **jsDelivr 下载**
 
 ```bash
-curl -fL --retry 3 --connect-timeout 15 \
-  https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.4/next-vps-setup.sh \
-  -o /root/next-vps-setup.download &&
-mv -fT -- /root/next-vps-setup.download /root/next-vps-setup.sh &&
-chmod 700 /root/next-vps-setup.sh &&
+(
+  tmp=$(mktemp /root/.next-vps-setup.XXXXXX) || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  curl -fL --retry 3 --connect-timeout 15 \
+    https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.5/next-vps-setup.sh -o "$tmp" &&
+  chmod 700 "$tmp" &&
+  mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-setup.sh
+) &&
 bash /root/next-vps-setup.sh
 ```
 
-也可以从 [V1.4 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.4) 下载脚本，上传到 `/root/next-vps-setup.sh`，再执行以下命令。
+也可以从 [V1.5 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.5) 下载脚本，上传到 `/root/next-vps-setup.sh`，再执行以下命令。
 
 ```bash
 chmod 700 /root/next-vps-setup.sh &&
@@ -98,11 +107,14 @@ cat /var/lib/next-vps-setup-result.tsv
 **旧内核清理后没有备用内核可回退，请在允许业务短暂中断时操作。**
 
 ```bash
-curl -fL --retry 3 --connect-timeout 15 \
-  https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.4/next-vps-kernel-update.sh \
-  -o /root/next-vps-kernel-update.download &&
-mv -fT -- /root/next-vps-kernel-update.download /root/next-vps-kernel-update.sh &&
-chmod 700 /root/next-vps-kernel-update.sh &&
+(
+  tmp=$(mktemp /root/.next-vps-kernel-update.XXXXXX) || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  curl -fL --retry 3 --connect-timeout 15 \
+    https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.5/next-vps-kernel-update.sh -o "$tmp" &&
+  chmod 700 "$tmp" &&
+  mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-kernel-update.sh
+) &&
 bash /root/next-vps-kernel-update.sh --check &&
 bash /root/next-vps-kernel-update.sh
 ```
@@ -129,7 +141,7 @@ bash /root/next-vps-kernel-update.sh --resume
 
 初始化日志：`/var/lib/next-vps-setup/next-vps-setup.log`；内核维护日志：`/var/lib/next-vps-kernel-update/run.log`。
 
-任务已提交但没有日志时，用 `journalctl -u next-vps-setup.service -n 80 --no-pager` 查看启动错误。内核维护请把服务名换成 `next-vps-kernel-update.service`。
+任务已提交但回执长期停在 `running` 时，用原脚本加 `--status` 查看后台状态。文件日志尚未生成时，用 `journalctl -u next-vps-setup.service -n 80 --no-pager` 查看启动错误。内核维护请把服务名换成 `next-vps-kernel-update.service`。
 
 如果日志明确提示已请求重启、但启动尚未发生，先确认 APT 和任务已停止，再通过商家控制台重启。重连后若任务仍显示失败，使用原脚本恢复。
 
