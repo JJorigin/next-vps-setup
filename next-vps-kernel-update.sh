@@ -1,9 +1,9 @@
 #!/bin/bash
-# next-vps-kernel-update 1.5 -- Debian 13 official-kernel maintenance.
+# next-vps-kernel-update 2.0 -- Debian 13 official-kernel maintenance.
 # Save under /root; run with bash and an absolute path. No network tuning.
 # Functions may be sourced by the isolated test harness; main is not then run.
 
-VERSION=1.5
+VERSION=2.0
 BASE=/var/lib/next-vps-kernel-update
 STATE=$BASE/state.tsv
 WORKER=$BASE/worker.sh
@@ -32,7 +32,7 @@ nv_ui_heading() {
 }
 nv_ui_stage_name() {
     case $1 in
-        swap) printf '准备小内存交换空间' ;;
+        swap) printf '检查和准备交换空间' ;;
         update) printf '更新 Debian 官方软件包和内核' ;;
         configure) printf '配置主机名、时区和 SSH 防护' ;;
         kernel) printf '检查新内核启动状态' ;;
@@ -76,7 +76,7 @@ nv_ui_stopped() {
 # BEGIN EMBEDDED ssh-notice
 # BEGIN NEXT_VPS_SSH_NOTICE
 # Embedded one-time root SSH login notice. This fragment only defines functions.
-# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
+# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH [SWAP_POLICY]
 # Tests may override the root directories and helper functions before render.
 
 nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
@@ -286,7 +286,7 @@ nv_notice_stage_name() {
     esac
 }
 nv_notice_text() {
-    local kind=$1 stage=$2 ntp=$3 entry=$4 result log title
+    local kind=$1 stage=$2 ntp=$3 entry=$4 swap=${5:-not-recorded} result log title
     result=/var/lib/$NV_NOTICE_APP-result.tsv
     if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
     else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
@@ -302,6 +302,12 @@ nv_notice_text() {
         printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n' || return 1
     fi
     if [[ $kind == success ]]; then
+        case $swap in
+            disk) printf '  磁盘 Swap：重启核验通过。\n' || return 1 ;;
+            preserve) printf '  Swap：已保留系统原有配置。\n' || return 1 ;;
+            skip-space) printf '  ⚠ Swap：磁盘空闲不足，本次跳过新建。\n' || return 1 ;;
+            skip-filesystem) printf '  ⚠ Swap：文件系统不支持自动创建，本次跳过新建。\n' || return 1 ;;
+        esac
         printf '  如需查看详细记录：\n    cat %s\n' "$result" || return 1
     else
         printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log" || return 1
@@ -315,9 +321,9 @@ nv_notice_install() (
     set -Eeuo pipefail
     export LC_ALL=C
     umask 077
-    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
+    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-} swap=${7:-not-recorded}
     local temp_dir= temp_hook= published_dir=no published_hook=no code first
-    (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
+    (( $#==6 || $#==7 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
     NV_NOTICE_APP=$1
     NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
     NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
@@ -325,6 +331,12 @@ nv_notice_install() (
     nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
     [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
     [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
+    case $swap in
+        not-recorded) ;;
+        disk|preserve|skip-space|skip-filesystem)
+            [[ $NV_NOTICE_APP == next-vps-setup && $kind == success ]] || exit 1 ;;
+        *) exit 1 ;;
+    esac
     [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
     nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
     nv_notice_lock -w 5 || { printf 'NOTICE_ERROR: 无法获取 root 通知锁\n' >&2; exit 1; }
@@ -350,7 +362,7 @@ nv_notice_install() (
     NV_NOTICE_GENERATION=$(cat /proc/sys/kernel/random/uuid) || exit 1
     nv_notice_uuid "$NV_NOTICE_GENERATION" || exit 1
     NV_NOTICE_DIR_ID=$(nv_notice_id "$temp_dir") || exit 1
-    nv_notice_text "$kind" "$stage" "$ntp" "$entry" > "$temp_dir/notice.txt" || exit 1
+    nv_notice_text "$kind" "$stage" "$ntp" "$entry" "$swap" > "$temp_dir/notice.txt" || exit 1
     chmod 0600 "$temp_dir/notice.txt" || exit 1
     NV_NOTICE_TEXT_ID=$(nv_notice_id "$temp_dir/notice.txt") || exit 1
     NV_NOTICE_TEXT_SHA=$(nv_notice_sha "$temp_dir/notice.txt") || exit 1
@@ -404,9 +416,18 @@ nv_task_show_unit_failure() {
     printf '结果：后台服务已失败。回执可能尚未更新，请查看服务日志。\n  journalctl -u %s -n 80 --no-pager\n' "$unit"
 }
 
+nv_task_require_unit_definition() {
+    local unit=$1 expected=$2 fragment dropins
+    fragment=$(systemctl show "$unit" -p FragmentPath --value) &&
+        dropins=$(systemctl show "$unit" -p DropInPaths --all) ||
+        die "无法读取 $unit 的 systemd 生效配置。"
+    [[ $fragment == "$expected" && $dropins == DropInPaths= ]] ||
+        die "$unit 的来源或覆盖配置与本任务不一致。"
+}
+
 # Check the normal Debian SSH boot path without changing its configuration.
 nv_task_require_ssh_boot() {
-    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state
+    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state socket_active
     [[ ! -e $ssh_dir/sshd_not_to_be_run && ! -L $ssh_dir/sshd_not_to_be_run ]] ||
         die 'Debian 的 SSH 禁用标记仍存在，自动重启后可能无法登录。'
     systemctl is-active --quiet ssh.service || die 'ssh.service 当前未运行。'
@@ -422,7 +443,10 @@ nv_task_require_ssh_boot() {
         socket_state=$(systemctl show ssh.socket -p LoadState --value) || die '无法读取 ssh.socket 的状态。'
     fi
     case $socket_state in disabled|masked|not-found) ;; *) die 'ssh.socket 已启用或无法核验其启动状态。' ;; esac
-    if systemctl is-active --quiet ssh.socket; then die '此工具要求 ssh.service 直接监听 SSH 端口。'; fi
+    if [[ $socket_state != not-found ]]; then
+        socket_active=$(systemctl show ssh.socket -p ActiveState --value) || die '无法确认 ssh.socket 的运行状态。'
+        [[ $socket_active == inactive || $socket_active == failed ]] || die '此工具要求 ssh.service 直接监听 SSH 端口。'
+    fi
 }
 # END EMBEDDED task-lock
 
@@ -455,10 +479,9 @@ safe_dir() {
 safe_entry() { [[ $1 == /root/*.sh && $1 =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $(readlink -e -- "$1") == "$1" ]] && plain_file "$1" && safe_dir "${1%/*}"; }
 abi_ok() {
     local meta=$1 abi=$2
-    [[ $abi =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-z0-9.+-]*-amd64$ ]] || return 1
     case $meta in
-        linux-image-cloud-amd64) [[ $abi == *-cloud-amd64 && $abi != *-rt-* ]] ;;
-        linux-image-amd64) [[ $abi != *-cloud-* && $abi != *-rt-* && $abi != *-unsigned* ]] ;;
+        linux-image-cloud-amd64) [[ $abi =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+|\+deb13(\.[0-9]+)?)?-cloud-amd64$ ]] ;;
+        linux-image-amd64) [[ $abi =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+|\+deb13(\.[0-9]+)?)?-amd64$ ]] ;;
         *) return 1 ;;
     esac
 }
@@ -538,7 +561,7 @@ purge_plan_remaining() {
         approved[$pkg]=$version
     done
     [[ -n $candidates ]] || return 0
-    while IFS== read -r pkg version; do
+    while IFS='=' read -r pkg version; do
         [[ -n $pkg && ${approved[$pkg]:-} == "$version" && ! -v seen[$pkg] ]] || return 1
         seen[$pkg]=1
         printf '%s\t%s\n' "$pkg" "$version"
@@ -686,9 +709,9 @@ validate_state() {
     [[ ${S[result_status]} != complete || ( ${S[phase]} == done && ${S[failed]} == no ) ]]
 }
 load_state() {
-    local path=$1 line key value octets
+    local path=$1 line key value octets size
     S=()
-    plain_file "$path" && (( $(stat -c %s -- "$path") <= 32768 )) || return 1
+    plain_file "$path" && size=$(stat -c %s -- "$path") && [[ $size =~ ^[0-9]{1,5}$ ]] && (( size <= 32768 )) || return 1
     octets=$(od -An -tx1 -- "$path") || return 1
     if grep -Eq '(^|[[:space:]])00([[:space:]]|$)' <<< "$octets"; then return 1; fi
     while IFS= read -r line || [[ -n $line ]]; do
@@ -734,8 +757,8 @@ receipt_field() {
     awk -F '\t' -v k="$key" '$1==k {n++; if(NF!=2)bad=1; v=$2} END{if(n!=1||bad)exit 1; print v}' "$path"
 }
 previous_complete() {
-    local format
-    plain_file "$RESULT" && (( $(stat -c %s -- "$RESULT") <= 32768 )) || return 1
+    local format size
+    plain_file "$RESULT" && size=$(stat -c %s -- "$RESULT") && [[ $size =~ ^[0-9]{1,5}$ ]] && (( size <= 32768 )) || return 1
     format=$(receipt_field "$RESULT" format) || return 1
     [[ ( $format == 1 || $format == 2 ) && $(receipt_field "$RESULT" phase) == done &&
        $(receipt_field "$RESULT" result_status) == complete && $(receipt_field "$RESULT" failed) == no &&
@@ -743,10 +766,15 @@ previous_complete() {
     uuid_ok "$(receipt_field "$RESULT" task_id)"
 }
 check_initialization() {
-    plain_file "$INIT_RESULT" || die 'A completed next-vps-setup receipt is required.'
+    local size format
+    plain_file "$INIT_RESULT" && size=$(stat -c %s -- "$INIT_RESULT") && [[ $size =~ ^[0-9]{1,5}$ ]] &&
+        (( size <= 16384 )) && format=$(receipt_field "$INIT_RESULT" format) &&
+        [[ $format == 3 || $format == 4 ]] || die 'A completed, supported next-vps-setup receipt is required.'
     [[ $(receipt_field "$INIT_RESULT" phase) == done && $(receipt_field "$INIT_RESULT" result_status) == complete && $(receipt_field "$INIT_RESULT" failed) == no ]] || die 'Initialization has not completed.'
     [[ $(receipt_field "$INIT_RESULT" machine_id) == "$(cat /etc/machine-id)" ]] || die 'Initialization receipt belongs to another machine.'
-    [[ ! -e /var/lib/next-vps-setup && ! -e /etc/systemd/system/next-vps-setup.service ]] || die 'An initialization task still exists.'
+    [[ ! -e /var/lib/next-vps-setup && ! -L /var/lib/next-vps-setup &&
+       ! -e /etc/systemd/system/next-vps-setup.service && ! -L /etc/systemd/system/next-vps-setup.service ]] ||
+        die 'An initialization task or a reserved initialization path still exists.'
 }
 check_os() {
     [[ $(id -u) == 0 ]] || die 'Run as root.'
@@ -765,11 +793,17 @@ check_os() {
     check_initialization
 }
 check_space() {
-    local root_free boot_free available
-    root_free=$(df -Pk / | awk 'END{print $4}'); boot_free=$(df -Pk "$BOOT_DIR" | awk 'END{print $4}')
-    available=$(awk '$1=="MemAvailable:"{print $2}' "$PROC_DIR/meminfo")
-    [[ $root_free =~ ^[0-9]+$ && $boot_free =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || die 'Cannot read available resources.'
-    (( root_free>=524288 && boot_free>=204800 && available>=131072 )) || die 'Need at least 512 MiB free on /, 200 MiB on /boot, and 128 MiB MemAvailable.'
+    local root_free boot_free var_free available value
+    root_free=$(df -k --output=avail -- / | awk 'NR==2{print $1}') &&
+        boot_free=$(df -k --output=avail -- "$BOOT_DIR" | awk 'NR==2{print $1}') &&
+        var_free=$(df -k --output=avail -- /var/lib | awk 'NR==2{print $1}') &&
+        available=$(awk '$1=="MemAvailable:"{print $2}' "$PROC_DIR/meminfo") ||
+        die 'Cannot read available resources.'
+    for value in "$root_free" "$boot_free" "$var_free" "$available"; do
+        [[ $value =~ ^(0|[1-9][0-9]{0,14})$ ]] || die 'Cannot read available resources.'
+    done
+    (( root_free>=524288 && var_free>=524288 && boot_free>=204800 && available>=131072 )) ||
+        die 'Need at least 512 MiB free on / and /var/lib, 200 MiB on /boot, and 128 MiB MemAvailable.'
 }
 # BEGIN NEXT-VPS OFFICIAL APT VIEW
 # This block is embedded unchanged in both standalone delivery scripts.
@@ -1404,14 +1438,21 @@ bootstrap_pending() {
        ${S[target_pkg]} == - && ${S[target_abi]} == - && ${S[target_version]} == - && ${S[meta_version]} == - ]]
 }
 write_unit() {
-    local tmp
+    local tmp bytes
     [[ ! -e $UNIT_FILE && ! -L $UNIT_FILE ]] || die 'A maintenance service already exists.'
     safe_dir "${UNIT_FILE%/*}" || die 'Unsafe maintenance service directory.'
-    tmp=$(mktemp "${UNIT_FILE%/*}/.next-vps-kernel-update.XXXXXX")
-    if ! unit_content > "$tmp" || ! chmod 0644 "$tmp" || ! sync -f "$tmp"; then
-        rm -- "$tmp" || true; die 'Cannot prepare maintenance service.'
+    tmp=${UNIT_FILE%/*}/.next-vps-kernel-update.${S[task_id]}.pending
+    if [[ -e $tmp || -L $tmp ]]; then
+        plain_file "$tmp" && bytes=$(stat -c %s -- "$tmp") && [[ $bytes =~ ^[0-9]{1,5}$ ]] &&
+            cmp -s -n "$bytes" -- "$tmp" <(unit_content) ||
+            die '已有内核维护服务暂存文件无法确认归属，已保留现场。'
+    else
+        (umask 077; set -o noclobber; : > "$tmp") || die 'Cannot create the maintenance service staging file.'
     fi
-    if ! mv -T -- "$tmp" "$UNIT_FILE"; then rm -- "$tmp" || true; die 'Cannot publish maintenance service.'; fi
+    if ! unit_content > "$tmp" || ! chmod 0644 "$tmp" || ! sync -f "$tmp"; then
+        die 'Cannot prepare maintenance service; the task-owned staging file was retained.'
+    fi
+    mv -T --no-copy --update=none-fail -- "$tmp" "$UNIT_FILE" || die 'Cannot publish maintenance service without overwriting its destination.'
     sync -f "${UNIT_FILE%/*}"
 }
 launch() {
@@ -1420,7 +1461,7 @@ launch() {
     trap 'on_error 143' TERM; trap 'on_error 129' HUP; trap 'on_error 130' INT
     plain_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die 'Maintenance service identity mismatch.'
     systemctl daemon-reload
-    [[ $(systemctl show "$UNIT" -p FragmentPath --value) == "$UNIT_FILE" && -z $(systemctl show "$UNIT" -p DropInPaths --value) ]] || die 'Unexpected maintenance service source or overrides.'
+    nv_task_require_unit_definition "$UNIT" "$UNIT_FILE"
     systemctl enable "$UNIT"; systemctl reset-failed "$UNIT"
     save_to "$RESULT"
     systemctl start --no-block "$UNIT"
@@ -1555,6 +1596,8 @@ worker() {
     trap 'code=$?; if ((code!=0)); then on_error "$code"; fi' EXIT
     trap 'on_error 143' TERM; trap 'on_error 129' HUP; trap 'on_error 130' INT
     check_os; verify_owned
+    plain_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die '后台内核维护服务文件与本任务不一致。'
+    nv_task_require_unit_definition "$UNIT" "$UNIT_FILE"
     while :; do
         nv_ui_progress "${S[phase]}"
         case ${S[phase]} in
@@ -1591,6 +1634,14 @@ print_status() {
     elif [[ ${S[result_status]} == cleanup_pending ]]; then
         printf '%s\n' '结果：内核核验通过，任务文件尚未清理完成。请使用同一版本 --resume。'
     else printf '%s\n' '结果：尚未完成。后台可能仍在执行，请查看日志。'; fi
+}
+print_previous_status() {
+    local version meta abi
+    previous_complete &&
+        version=$(receipt_field "$RESULT" version) && [[ $version =~ ^1\.(1(\.1)?|[2-5])$ ]] &&
+        meta=$(receipt_field "$RESULT" meta) && abi=$(receipt_field "$RESULT" target_abi) &&
+        abi_ok "$meta" "$abi" || return 1
+    printf '旧版内核维护回执（%s）\n结果：已完成。\n当时核验的内核：%s\n' "$version" "$abi"
 }
 check_new_task_paths() {
     local apt_root
@@ -1705,7 +1756,10 @@ main() {
     if [[ $mode == --apt-guard ]]; then apt_guard; return; fi
     if [[ $mode == --status ]]; then
         if [[ -e $STATE || -L $STATE ]]; then load_state "$STATE" || die 'Invalid task state.'
-        else load_state "$RESULT" || die 'No valid task or result.'; fi
+        elif ! load_state "$RESULT"; then
+            print_previous_status || die 'No valid task or result.'
+            return
+        fi
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'Wrong machine.'
         print_status; return
     fi

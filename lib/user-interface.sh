@@ -8,7 +8,7 @@ nv_ui_heading() {
 }
 nv_ui_stage_name() {
     case $1 in
-        swap) printf '准备小内存交换空间' ;;
+        swap) printf '检查和准备交换空间' ;;
         update) printf '更新 Debian 官方软件包和内核' ;;
         configure) printf '配置主机名、时区和 SSH 防护' ;;
         kernel) printf '检查新内核启动状态' ;;

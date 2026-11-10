@@ -1,6 +1,6 @@
 # BEGIN NEXT_VPS_SSH_NOTICE
 # Embedded one-time root SSH login notice. This fragment only defines functions.
-# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
+# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH [SWAP_POLICY]
 # Tests may override the root directories and helper functions before render.
 
 nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
@@ -210,7 +210,7 @@ nv_notice_stage_name() {
     esac
 }
 nv_notice_text() {
-    local kind=$1 stage=$2 ntp=$3 entry=$4 result log title
+    local kind=$1 stage=$2 ntp=$3 entry=$4 swap=${5:-not-recorded} result log title
     result=/var/lib/$NV_NOTICE_APP-result.tsv
     if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
     else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
@@ -226,6 +226,12 @@ nv_notice_text() {
         printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n' || return 1
     fi
     if [[ $kind == success ]]; then
+        case $swap in
+            disk) printf '  磁盘 Swap：重启核验通过。\n' || return 1 ;;
+            preserve) printf '  Swap：已保留系统原有配置。\n' || return 1 ;;
+            skip-space) printf '  ⚠ Swap：磁盘空闲不足，本次跳过新建。\n' || return 1 ;;
+            skip-filesystem) printf '  ⚠ Swap：文件系统不支持自动创建，本次跳过新建。\n' || return 1 ;;
+        esac
         printf '  如需查看详细记录：\n    cat %s\n' "$result" || return 1
     else
         printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log" || return 1
@@ -239,9 +245,9 @@ nv_notice_install() (
     set -Eeuo pipefail
     export LC_ALL=C
     umask 077
-    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
+    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-} swap=${7:-not-recorded}
     local temp_dir= temp_hook= published_dir=no published_hook=no code first
-    (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
+    (( $#==6 || $#==7 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
     NV_NOTICE_APP=$1
     NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
     NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
@@ -249,6 +255,12 @@ nv_notice_install() (
     nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
     [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
     [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
+    case $swap in
+        not-recorded) ;;
+        disk|preserve|skip-space|skip-filesystem)
+            [[ $NV_NOTICE_APP == next-vps-setup && $kind == success ]] || exit 1 ;;
+        *) exit 1 ;;
+    esac
     [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
     nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
     nv_notice_lock -w 5 || { printf 'NOTICE_ERROR: 无法获取 root 通知锁\n' >&2; exit 1; }
@@ -274,7 +286,7 @@ nv_notice_install() (
     NV_NOTICE_GENERATION=$(cat /proc/sys/kernel/random/uuid) || exit 1
     nv_notice_uuid "$NV_NOTICE_GENERATION" || exit 1
     NV_NOTICE_DIR_ID=$(nv_notice_id "$temp_dir") || exit 1
-    nv_notice_text "$kind" "$stage" "$ntp" "$entry" > "$temp_dir/notice.txt" || exit 1
+    nv_notice_text "$kind" "$stage" "$ntp" "$entry" "$swap" > "$temp_dir/notice.txt" || exit 1
     chmod 0600 "$temp_dir/notice.txt" || exit 1
     NV_NOTICE_TEXT_ID=$(nv_notice_id "$temp_dir/notice.txt") || exit 1
     NV_NOTICE_TEXT_SHA=$(nv_notice_sha "$temp_dir/notice.txt") || exit 1

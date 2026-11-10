@@ -1,6 +1,6 @@
 # Debian 13 内核维护
 
-`next-vps-kernel-update.sh` V1.5 是 `next-vps-setup` 的配套工具，用于初始化完成后的内核更新。
+`next-vps-kernel-update.sh` 2.0 是 `next-vps-setup` 的配套工具，用于初始化完成后的内核更新。
 
 工具更新 Debian 官方稳定源内核，保留原来的 cloud／标准 amd64 系列，自动重启一次。新启动核验通过后，动态清理旧内核，只保留本次目标内核和原系列元包。原初始化配置和结果文件保留，不执行整套软件包升级。
 
@@ -8,7 +8,7 @@
 
 - Debian 13、amd64、systemd 虚拟机，使用 root。`/root` 由 root 独占访问，例如权限为 `0700`。
 - 本机已有成功完成的 `next-vps-setup` 初始化结果；无需重新初始化。
-- 根分区至少512MiB空闲、`/boot` 至少200MiB空闲、可用内存至少128MiB。
+- 根分区和 `/var/lib` 各至少 512 MiB 空闲，`/boot` 至少 200 MiB 空闲，可用内存至少 128 MiB。
 - SSH 和 Fail2ban 正常运行。`ssh.service` 随 `multi-user.target` 开机启动，默认启动目标为 `multi-user.target` 或 `graphical.target`。商家控制台可用。
 - VPS 可直连 `deb.debian.org` 和 `security.debian.org` 的 TCP 80 出站端口，任务使用自己的 APT 配置。
 - 没有其他初始化、内核维护或 APT 安装任务同时运行。
@@ -28,7 +28,7 @@ GitHub：
   tmp=$(mktemp /root/.next-vps-kernel-update.XXXXXX) || exit 1
   trap 'rm -f -- "$tmp"' EXIT
   curl -fL --retry 3 --connect-timeout 15 \
-    https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.5/next-vps-kernel-update.sh -o "$tmp" &&
+    https://raw.githubusercontent.com/JJorigin/next-vps-setup/2.0/next-vps-kernel-update.sh -o "$tmp" &&
   chmod 700 "$tmp" &&
   mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-kernel-update.sh
 ) &&
@@ -42,14 +42,14 @@ jsDelivr：
   tmp=$(mktemp /root/.next-vps-kernel-update.XXXXXX) || exit 1
   trap 'rm -f -- "$tmp"' EXIT
   curl -fL --retry 3 --connect-timeout 15 \
-    https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.5/next-vps-kernel-update.sh -o "$tmp" &&
+    https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@2.0/next-vps-kernel-update.sh -o "$tmp" &&
   chmod 700 "$tmp" &&
   mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-kernel-update.sh
 ) &&
 bash /root/next-vps-kernel-update.sh --check
 ```
 
-没有 `curl` 或 CA 证书时，可从 [V1.5 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.5) 下载脚本并上传到 `/root/next-vps-kernel-update.sh`。上传后执行以下命令。
+没有 `curl` 或 CA 证书时，可从 [2.0 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/2.0) 下载脚本并上传到 `/root/next-vps-kernel-update.sh`。上传后执行以下命令。
 
 ```bash
 chmod 700 /root/next-vps-kernel-update.sh &&
@@ -134,7 +134,7 @@ V1.2 若提示 `Swap or swappiness did not persist.`，可能是旧命令误将 
 
 ### 旧版仅在前置检查停止
 
-若旧版仅在 `--check` 提示官方密钥文件不支持，且尚未创建维护任务，可以下载 V1.5 后重新检查。Debian 的官方 `.gpg` → `.pgp` 兼容链接无需手动修改或删除。
+若旧版仅在 `--check` 提示官方密钥文件不支持，且尚未创建维护任务，可以换成 2.0 再检查。下载命令会保留已有文件，可先将旧脚本改名。Debian 的官方 `.gpg` → `.pgp` 兼容链接无需手动修改。
 
 ## 下次维护
 

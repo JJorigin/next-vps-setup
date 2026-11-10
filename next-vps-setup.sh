@@ -1,10 +1,10 @@
 #!/bin/bash
-# next-vps-setup v1.5 -- local-file installation, root, Debian 13 amd64 VM.
+# next-vps-setup v2.0 -- local-file installation, root, Debian 13 amd64 VM.
 # Run: bash /root/next-vps-setup.sh
 # Inspect: bash /root/next-vps-setup.sh --status
 # Retry after repairing a failure: bash /root/next-vps-setup.sh --resume
 # No passwords, SSH configuration changes, TCP tuning or third-party repositories.
-# Fresh systems only. Low-memory policy: MemTotal <= 1 GiB -> 1 GiB disk Swap, swappiness 10.
+# Fresh systems only. New disk Swap: MemTotal rounded up to GiB, swappiness 10.
 
 if [ -z "${BASH_VERSION:-}" ]; then printf '%s\n' 'Use bash /root/next-vps-setup.sh' >&2; exit 2; fi
 if [[ ${BASH_SOURCE[0]:-} != "$0" ]]; then printf '%s\n' 'Do not source this file.' >&2; return 2; fi
@@ -28,9 +28,12 @@ SWAP_FILE=$SWAP_DIR/swapfile
 SWAP_UNIT=var-lib-nextvpssetup-swapfile.swap
 SWAP_UNIT_FILE=/etc/systemd/system/$SWAP_UNIT
 SWAP_SYSCTL=/etc/sysctl.d/99-next-vps-setup.conf
-SWAP_BYTES=1073741824
-SWAP_RESERVE_KIB=1048576
-VERSION=1.5
+KIB_PER_GIB=1048576
+BYTES_PER_GIB=1073741824
+SWAP_RESERVE_KIB=$KIB_PER_GIB
+SWAP_PREPARE_KIB=16384
+SWAP_MAX_PAGES=4294967295
+VERSION=2.0
 declare -A S=()
 IN_REBOOT=no
 BOOTSTRAP_BASE_ID=
@@ -48,7 +51,7 @@ nv_ui_heading() {
 }
 nv_ui_stage_name() {
     case $1 in
-        swap) printf '准备小内存交换空间' ;;
+        swap) printf '检查和准备交换空间' ;;
         update) printf '更新 Debian 官方软件包和内核' ;;
         configure) printf '配置主机名、时区和 SSH 防护' ;;
         kernel) printf '检查新内核启动状态' ;;
@@ -92,7 +95,7 @@ nv_ui_stopped() {
 # BEGIN EMBEDDED ssh-notice
 # BEGIN NEXT_VPS_SSH_NOTICE
 # Embedded one-time root SSH login notice. This fragment only defines functions.
-# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH
+# API: nv_notice_install APP success|failure TASK_UUID STAGE NTP_STATUS ENTRY_PATH [SWAP_POLICY]
 # Tests may override the root directories and helper functions before render.
 
 nv_notice_is_root() { [[ ${EUID:-$(id -u)} == 0 ]]; }
@@ -302,7 +305,7 @@ nv_notice_stage_name() {
     esac
 }
 nv_notice_text() {
-    local kind=$1 stage=$2 ntp=$3 entry=$4 result log title
+    local kind=$1 stage=$2 ntp=$3 entry=$4 swap=${5:-not-recorded} result log title
     result=/var/lib/$NV_NOTICE_APP-result.tsv
     if [[ $NV_NOTICE_APP == next-vps-setup ]]; then log=/var/lib/next-vps-setup/next-vps-setup.log; title='VPS 初始化'
     else log=/var/lib/next-vps-kernel-update/run.log; title='内核维护'; fi
@@ -318,6 +321,12 @@ nv_notice_text() {
         printf '  ⚠ 时间同步警告：尚未确认同步，沿用系统当前时间。\n' || return 1
     fi
     if [[ $kind == success ]]; then
+        case $swap in
+            disk) printf '  磁盘 Swap：重启核验通过。\n' || return 1 ;;
+            preserve) printf '  Swap：已保留系统原有配置。\n' || return 1 ;;
+            skip-space) printf '  ⚠ Swap：磁盘空闲不足，本次跳过新建。\n' || return 1 ;;
+            skip-filesystem) printf '  ⚠ Swap：文件系统不支持自动创建，本次跳过新建。\n' || return 1 ;;
+        esac
         printf '  如需查看详细记录：\n    cat %s\n' "$result" || return 1
     else
         printf '  下一步：查看失败详情。\n    tail -n 100 %s\n' "$log" || return 1
@@ -331,9 +340,9 @@ nv_notice_install() (
     set -Eeuo pipefail
     export LC_ALL=C
     umask 077
-    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-}
+    local kind=${2:-} task=${3:-} stage=${4:-} ntp=${5:-} entry=${6:-} swap=${7:-not-recorded}
     local temp_dir= temp_hook= published_dir=no published_hook=no code first
-    (( $#==6 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
+    (( $#==6 || $#==7 )) || { printf 'NOTICE_ERROR: invalid argument count\n' >&2; exit 1; }
     NV_NOTICE_APP=$1
     NV_NOTICE_PROFILE_DIR=${NV_NOTICE_PROFILE_DIR:-/etc/profile.d}
     NV_NOTICE_DATA_ROOT=${NV_NOTICE_DATA_ROOT:-/var/lib}
@@ -341,6 +350,12 @@ nv_notice_install() (
     nv_notice_is_root && nv_notice_paths || { printf 'NOTICE_ERROR: root and recognized application required\n' >&2; exit 1; }
     [[ $kind == success || $kind == failure ]] && nv_notice_uuid "$task" || { printf 'NOTICE_ERROR: only terminal states are accepted\n' >&2; exit 1; }
     [[ $stage =~ ^[a-z][a-z0-9_-]{0,31}$ && ( $ntp == synchronized || $ntp == unsynchronized || $ntp == unavailable || $ntp == not-recorded ) ]] || { printf 'NOTICE_ERROR: invalid status fields\n' >&2; exit 1; }
+    case $swap in
+        not-recorded) ;;
+        disk|preserve|skip-space|skip-filesystem)
+            [[ $NV_NOTICE_APP == next-vps-setup && $kind == success ]] || exit 1 ;;
+        *) exit 1 ;;
+    esac
     [[ $entry == /root/*.sh && $entry =~ ^/root/[a-zA-Z0-9_./-]+\.sh$ && $entry != *'/../'* && $entry != *'/./'* ]] || { printf 'NOTICE_ERROR: invalid entry path\n' >&2; exit 1; }
     nv_notice_safe_dir "$NV_NOTICE_PROFILE_DIR" && nv_notice_safe_dir "$NV_NOTICE_DATA_ROOT" || { printf 'NOTICE_ERROR: unsafe parent directory\n' >&2; exit 1; }
     nv_notice_lock -w 5 || { printf 'NOTICE_ERROR: 无法获取 root 通知锁\n' >&2; exit 1; }
@@ -366,7 +381,7 @@ nv_notice_install() (
     NV_NOTICE_GENERATION=$(cat /proc/sys/kernel/random/uuid) || exit 1
     nv_notice_uuid "$NV_NOTICE_GENERATION" || exit 1
     NV_NOTICE_DIR_ID=$(nv_notice_id "$temp_dir") || exit 1
-    nv_notice_text "$kind" "$stage" "$ntp" "$entry" > "$temp_dir/notice.txt" || exit 1
+    nv_notice_text "$kind" "$stage" "$ntp" "$entry" "$swap" > "$temp_dir/notice.txt" || exit 1
     chmod 0600 "$temp_dir/notice.txt" || exit 1
     NV_NOTICE_TEXT_ID=$(nv_notice_id "$temp_dir/notice.txt") || exit 1
     NV_NOTICE_TEXT_SHA=$(nv_notice_sha "$temp_dir/notice.txt") || exit 1
@@ -420,9 +435,18 @@ nv_task_show_unit_failure() {
     printf '结果：后台服务已失败。回执可能尚未更新，请查看服务日志。\n  journalctl -u %s -n 80 --no-pager\n' "$unit"
 }
 
+nv_task_require_unit_definition() {
+    local unit=$1 expected=$2 fragment dropins
+    fragment=$(systemctl show "$unit" -p FragmentPath --value) &&
+        dropins=$(systemctl show "$unit" -p DropInPaths --all) ||
+        die "无法读取 $unit 的 systemd 生效配置。"
+    [[ $fragment == "$expected" && $dropins == DropInPaths= ]] ||
+        die "$unit 的来源或覆盖配置与本任务不一致。"
+}
+
 # Check the normal Debian SSH boot path without changing its configuration.
 nv_task_require_ssh_boot() {
-    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state
+    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state socket_active
     [[ ! -e $ssh_dir/sshd_not_to_be_run && ! -L $ssh_dir/sshd_not_to_be_run ]] ||
         die 'Debian 的 SSH 禁用标记仍存在，自动重启后可能无法登录。'
     systemctl is-active --quiet ssh.service || die 'ssh.service 当前未运行。'
@@ -438,16 +462,20 @@ nv_task_require_ssh_boot() {
         socket_state=$(systemctl show ssh.socket -p LoadState --value) || die '无法读取 ssh.socket 的状态。'
     fi
     case $socket_state in disabled|masked|not-found) ;; *) die 'ssh.socket 已启用或无法核验其启动状态。' ;; esac
-    if systemctl is-active --quiet ssh.socket; then die '此工具要求 ssh.service 直接监听 SSH 端口。'; fi
+    if [[ $socket_state != not-found ]]; then
+        socket_active=$(systemctl show ssh.socket -p ActiveState --value) || die '无法确认 ssh.socket 的运行状态。'
+        [[ $socket_active == inactive || $socket_active == failed ]] || die '此工具要求 ssh.service 直接监听 SSH 端口。'
+    fi
 }
 # END EMBEDDED task-lock
 
 die() { nv_ui_stopped "$*" >&2; exit 1; }
 note() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 publish_login_notice() {
-    local kind=$1 ntp=${S[ntp_status]:-not-recorded}
+    local kind=$1 ntp=${S[ntp_status]:-not-recorded} swap=not-recorded
     case $ntp in synchronized|unsynchronized|unavailable) ;; *) ntp=not-recorded ;; esac
-    NV_NOTICE_LOCK_DIR=/root nv_notice_install next-vps-setup "$kind" "${S[task_id]}" "${S[phase]}" "$ntp" "${S[entry_path]}"
+    if [[ $kind == success ]]; then swap=${S[swap_policy]}; fi
+    NV_NOTICE_LOCK_DIR=/root nv_notice_install next-vps-setup "$kind" "${S[task_id]}" "${S[phase]}" "$ntp" "${S[entry_path]}" "$swap"
 }
 validate_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
 validate_boot_id() { [[ $1 =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
@@ -486,10 +514,11 @@ memtotal() {
     awk '$1=="MemTotal:" {n++; if (NF!=3 || $2!~/^[1-9][0-9]*$/ || $3!="kB") bad=1; v=$2}
          END {if(n!=1 || bad)exit 1; print v}' /proc/meminfo
 }
-memory_policy() {
+swap_target_bytes() {
     local value=$1
     [[ $value =~ ^[1-9][0-9]{0,14}$ ]] || return 1
-    if (( value <= 1048576 )); then printf 'disk1g\n'; else printf 'skip\n'; fi
+    # At most 15 digits of KiB keeps the result inside signed 64-bit arithmetic.
+    printf '%s\n' "$(((1 + (value - 1) / KIB_PER_GIB) * BYTES_PER_GIB))"
 }
 boot_id() { local value; value=$(cat /proc/sys/kernel/random/boot_id); validate_boot_id "$value" || return 1; printf '%s\n' "$value"; }
 file_sha() { sha256sum -- "$1" | awk '{print $1}'; }
@@ -528,7 +557,7 @@ validate_state_value() {
     local key=$1 value=$2
     [[ -n $value && $value != *[[:cntrl:]]* ]] || return 1
     case $key in
-        format) [[ $value == 3 ]] ;;
+        format) [[ $value == 3 || $value == 4 ]] ;;
         task_id) validate_boot_id "$value" ;;
         machine_id) [[ $value =~ ^[a-f0-9]{32}$ ]] ;;
         hostname) validate_hostname "$value" ;;
@@ -538,15 +567,16 @@ validate_state_value() {
         ntp_unit) [[ $value == - || $value == systemd-timesyncd.service || $value == chrony.service || $value == ntpsec.service || $value == ntp.service || $value == openntpd.service ]] ;;
         ntp_status) [[ $value == pending || $value == synchronized || $value == unsynchronized || $value == unavailable ]] ;;
         balloon) [[ $value == pending || $value == module || $value == absent ]] ;;
-        swap_policy) [[ $value == skip || $value == disk1g ]] ;;
+        swap_policy) [[ $value == disk || $value == preserve || $value == skip-space || $value == skip-filesystem || $value == skip || $value == disk1g ]] ;;
+        swap_bytes) [[ $value =~ ^[1-9][0-9]{0,18}$ ]] ;;
         mem_kib) [[ $value =~ ^[1-9][0-9]{0,14}$ ]] ;;
         swap_uuid) [[ $value == - ]] || validate_boot_id "$value" ;;
         swap_identity)
-            # Keep completed V1.4 receipts readable. New tasks record a
+            # Keep older completed receipts readable. New tasks record a
             # filesystem UUID instead of a boot-dependent device number.
             [[ $value == - || $value =~ ^[0-9]+:[0-9]+$ ]] ||
                 { [[ ${value##*:} =~ ^[1-9][0-9]*$ ]] && validate_boot_id "${value%:*}"; } ;;
-        swap_status) [[ $value == pending || $value == building || $value == active || $value == verified || $value == skipped ]] ;;
+        swap_status) [[ $value == pending || $value == building || $value == prepared || $value == active || $value == verified || $value == preserved || $value == skipped ]] ;;
         phase) [[ $value == update || $value == configure || $value == kernel || $value == balloon || $value == swap || $value == final || $value == cleanup || $value == "done" ]] ;;
         boot_before|verified_boot) [[ $value == - ]] || validate_boot_id "$value" ;;
         last_config_boot) validate_boot_id "$value" ;;
@@ -566,25 +596,55 @@ validate_state_value() {
 state_keys() {
     printf '%s\n' format task_id machine_id hostname ssh_port kernel_meta target_kernel ntp_unit balloon swap_policy swap_status swap_uuid swap_identity mem_kib phase boot_before last_config_boot reboot_count reboot_wait failed entry_path entry_identity entry_sha worker_sha ssh_policy_sha result_status verified_boot verified_at config_hashes packages
     printf '%s\n' ntp_status
+    if [[ ${S[format]:-4} == 4 ]]; then printf '%s\n' swap_bytes; fi
+}
+validate_swap_state() {
+    local target expected mem_kib=${S[mem_kib]}
+    if [[ ${S[format]} == 3 ]]; then
+        # Older completed receipts may be read, but never used to resume a job.
+        [[ ${S[phase]} == done && ${S[result_status]} == complete ]] || return 1
+        if (( mem_kib <= KIB_PER_GIB )); then
+            [[ ${S[swap_policy]} == disk1g && ${S[swap_status]} == verified && ${S[swap_uuid]} != - && ${S[swap_identity]} != - ]]
+        else
+            [[ ${S[swap_policy]} == skip && ${S[swap_status]} == skipped && ${S[swap_uuid]} == - && ${S[swap_identity]} == - ]]
+        fi
+        return
+    fi
+    target=$(swap_target_bytes "${S[mem_kib]}") && [[ ${S[swap_bytes]} == "$target" ]] || return 1
+    case ${S[swap_policy]} in
+        disk)
+            case ${S[swap_status]} in
+                pending) [[ ${S[swap_uuid]} == - && ${S[swap_identity]} == - ]] || return 1 ;;
+                building) validate_boot_id "${S[swap_uuid]}" || return 1 ;;
+                prepared|active|verified) validate_boot_id "${S[swap_uuid]}" && [[ ${S[swap_identity]} != - ]] || return 1 ;;
+                *) return 1 ;;
+            esac
+            if [[ ${S[swap_identity]} != - ]]; then validate_boot_id "${S[swap_identity]%:*}" || return 1; fi
+            if [[ ${S[phase]} == swap ]]; then [[ ${S[swap_status]} != verified ]]
+            elif [[ ${S[result_status]} == running ]]; then [[ ${S[swap_status]} == active ]]
+            else [[ ${S[swap_status]} == verified ]]; fi ;;
+        preserve|skip-space|skip-filesystem)
+            [[ ${S[swap_uuid]} == - && ${S[swap_identity]} == - ]] || return 1
+            expected=preserved
+            if [[ ${S[swap_policy]} != preserve ]]; then
+                (( mem_kib > KIB_PER_GIB )) || return 1
+                expected=skipped
+            fi
+            if [[ ${S[phase]} == swap ]]; then expected=pending; fi
+            [[ ${S[swap_status]} == "$expected" ]] ;;
+        *) return 1 ;;
+    esac
 }
 validate_state() {
-    local key
+    local key count=0
     while IFS= read -r key; do
         [[ -v S[$key] ]] && validate_state_value "$key" "${S[$key]}" || return 1
+        count=$((count+1))
     done < <(state_keys)
-    [[ ${S[format]} == 3 && ${#S[@]} == 31 ]] || return 1
+    (( ${#S[@]} == count )) || return 1
     [[ ${S[ntp_status]} != synchronized || ${S[ntp_unit]} != - ]] || return 1
     [[ ${S[result_status]} == running || ${S[ntp_status]} != pending ]] || return 1
-    [[ $(memory_policy "${S[mem_kib]}") == "${S[swap_policy]}" ]] || return 1
-    if [[ ${S[swap_policy]} == skip ]]; then
-        [[ ${S[swap_uuid]} == - && ${S[swap_identity]} == - && ( ${S[swap_status]} == pending || ${S[swap_status]} == skipped ) ]] || return 1
-    else
-        [[ ${S[swap_status]} != skipped ]] || return 1
-        if [[ ${S[swap_status]} != pending ]]; then validate_boot_id "${S[swap_uuid]}" || return 1; fi
-        if [[ ${S[swap_status]} == active || ${S[swap_status]} == verified ]]; then
-            [[ ${S[swap_identity]} != - ]] || return 1
-        fi
-    fi
+    validate_swap_state || return 1
     if [[ ${S[reboot_wait]} != none ]]; then
         validate_boot_id "${S[boot_before]}" && [[ ${S[reboot_count]} != 0 && ${S[target_kernel]} != - ]] || return 1
     fi
@@ -597,8 +657,6 @@ validate_state() {
         running) [[ ${S[phase]} != cleanup && ${S[phase]} != "done" ]] || return 1 ;;
     esac
     if [[ ${S[result_status]} != running ]]; then
-        if [[ ${S[swap_policy]} == disk1g ]]; then [[ ${S[swap_status]} == verified ]] || return 1
-        else [[ ${S[swap_status]} == skipped ]] || return 1; fi
         validate_boot_id "${S[verified_boot]}" && [[ ${S[verified_at]} != 0 && ${S[config_hashes]} != - && ${S[packages]} != - ]] || return 1
         [[ ${S[reboot_count]} != 0 && ${S[reboot_wait]} == none && ${S[last_config_boot]} != "${S[verified_boot]}" ]] || return 1
     fi
@@ -699,14 +757,22 @@ detect_ntp() {
     printf '%s\n' "$found"
 }
 check_resources() {
-    local root_free boot_free inodes available needed_root=2097152
-    root_free=$(df -Pk / | awk 'END{print $4}')
-    boot_free=$(df -Pk /boot | awk 'END{print $4}')
-    inodes=$(df -Pi / | awk 'END{print $4}')
-    available=$(awk '$1=="MemAvailable:"{print $2}' /proc/meminfo)
-    [[ $root_free =~ ^[0-9]+$ && $boot_free =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || die 'Cannot inspect available resources.'
-    if [[ ${S[swap_status]:-pending} == active || ${S[swap_status]:-pending} == verified ]]; then needed_root=1048576; fi
-    (( root_free >= needed_root && boot_free >= 204800 && inodes >= 10000 && available >= 131072 )) || die 'Insufficient resources: need 2 GiB initial root space (1 GiB after the owned Swap exists), 200 MiB /boot, 10000 free inodes and 128 MiB MemAvailable.' 
+    local root_free boot_free var_free inodes available root_dev swap_dev needed_root=$((2 * KIB_PER_GIB))
+    root_free=$(df -k --output=avail -- / | awk 'NR==2{print $1}') &&
+        boot_free=$(df -k --output=avail -- /boot | awk 'NR==2{print $1}') &&
+        inodes=$(df --output=iavail -- / | awk 'NR==2{print $1}') &&
+        available=$(awk '$1=="MemAvailable:"{print $2}' /proc/meminfo) || die 'Cannot inspect available resources.'
+    var_free=$(swap_free_kib) || return 1
+    local value
+    for value in "$root_free" "$boot_free" "$inodes" "$available"; do
+        [[ $value =~ ^(0|[1-9][0-9]{0,14})$ ]] || die 'Cannot inspect available resources.'
+    done
+    if [[ ${S[swap_status]:-pending} == active || ${S[swap_status]:-pending} == verified ]]; then
+        root_dev=$(stat -c %d -- /) && swap_dev=$(stat -c %d -- "$SWAP_FILE") || die 'Cannot inspect the root and Swap filesystems.'
+        if [[ $root_dev == "$swap_dev" ]]; then needed_root=$KIB_PER_GIB; fi
+    fi
+    (( root_free >= needed_root && boot_free >= 204800 && var_free >= SWAP_RESERVE_KIB && inodes >= 10000 && available >= 131072 )) ||
+        die 'Insufficient resources: need 2 GiB free on / (1 GiB after creating Swap on the same filesystem), 1 GiB on /var/lib, 200 MiB on /boot, 10000 free root inodes and 128 MiB MemAvailable.'
 }
 check_os() {
     [[ $(id -u) == 0 ]] || die 'Use a root login, or sudo -i, then run the local /root copy.'
@@ -1230,27 +1296,38 @@ fresh_fail2ban_preflight() {
     done
 }
 swap_owner_content() {
-    printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "$SWAP_BYTES"
+    printf 'format\t1\ntask_id\t%s\nmachine_id\t%s\nswap_uuid\t%s\nbytes\t%s\n' "${S[task_id]}" "${S[machine_id]}" "${S[swap_uuid]}" "${S[swap_bytes]}"
 }
 swap_unit_content() {
-    printf '%s\n' '# Managed by next-vps-setup v1.3' '[Unit]' 'Description=next-vps-setup low-memory disk Swap (1 GiB)' \
+    local bytes=${S[swap_bytes]}
+    printf '%s\n' '# Managed by next-vps-setup' '[Unit]' "Description=next-vps-setup disk Swap ($((bytes / BYTES_PER_GIB)) GiB)" \
         '' '[Swap]' "What=$SWAP_FILE" 'Priority=10' 'TimeoutSec=90s' \
         '' '[Install]' 'WantedBy=swap.target'
 }
-swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup v1.3' 'vm.swappiness = 10'; }
+swap_sysctl_content() { printf '%s\n' '# Managed by next-vps-setup' 'vm.swappiness = 10'; }
 swap_mount_field() {
     local value
-    value=$(findmnt --raw --noheadings --first-only --output "$1" --target /var/lib) || die 'Cannot inspect the Swap filesystem.'
+    value=$(findmnt --raw --noheadings --first-only --nofsroot --output "$1" --target /var/lib) || die '无法读取 /var/lib 的文件系统信息。'
     [[ -n $value && $value != *[[:space:]]* ]] || die 'Ambiguous Swap filesystem metadata.'
     printf '%s\n' "$value"
 }
-swap_filesystem_check() {
-    local source options uuid
-    safe_swap_dir /var/lib && safe_swap_dir /etc/systemd/system && safe_swap_dir /etc/sysctl.d || die 'Unsafe disk Swap configuration directories.'
-    [[ $(swap_mount_field FSTYPE) == ext4 ]] || die 'Automatic Swap creation supports a writable local ext4 filesystem only; no filesystem was changed.'
-    source=$(swap_mount_field SOURCE); options=$(swap_mount_field OPTIONS)
-    [[ $source == /dev/* && -b $source && ,$options, != *,ro,* ]] || die 'Expected a writable local ext4 block filesystem for Swap.'
+swap_require_writable_varlib() {
+    local options
+    options=$(swap_mount_field OPTIONS) || return 1
+    [[ ,$options, == *,rw,* && ,$options, != *,ro,* ]] || die '/var/lib 不可写，无法保存任务状态及 APT 暂存文件。'
+}
+swap_ext4_device_check() {
+    local source uuid
+    source=$(swap_mount_field SOURCE) || return 1
+    [[ $source == /dev/* && -b $source ]] || die '无法确认 /var/lib 对应的本地 ext4 块设备。'
     uuid=$(swap_mount_field UUID) && validate_boot_id "$uuid" || die 'The Swap filesystem must have a readable ext4 UUID.'
+}
+swap_filesystem_check() {
+    local type
+    swap_require_writable_varlib || return 1
+    type=$(swap_mount_field FSTYPE) || return 1
+    [[ $type == ext4 ]] || die '本任务的 Swap 必须位于可写的本地 ext4 文件系统。'
+    swap_ext4_device_check
 }
 swap_file_identity() {
     local file=$1 uuid inode
@@ -1258,22 +1335,50 @@ swap_file_identity() {
     inode=$(stat -c %i -- "$file") && [[ $inode =~ ^[1-9][0-9]*$ ]] || return 1
     printf '%s:%s\n' "$uuid" "$inode"
 }
-swap_no_conflicts() {
-    local mode=$1 listing file value status unit load active sub rest what
-    awk -v own="$SWAP_FILE" -v allow="$mode" '
-        NR==1 {if(NF!=5 || $1!="Filename" || $5!="Priority")bad=1}
-        NR>1 {if(allow!="owned" || $1!=own || $2!="file")bad=1}
-        END{exit bad}' /proc/swaps || die 'Existing unknown active Swap; it was not disabled or replaced.'
-    awk '$0!~/^[[:space:]]*#/ && NF>=3 && $3=="swap" {bad=1} END{exit bad}' /etc/fstab || die 'Existing fstab Swap conflicts with automatic creation; it was not changed.'
-    listing=$(systemctl list-unit-files --full --no-legend --no-pager) || die 'Cannot inspect persistent Swap units.'
-    awk -v own="$SWAP_UNIT" -v allow="$mode" '$1~/[.]swap$/ && !(allow=="owned" && $1==own) {bad=1} END{exit bad}' <<< "$listing" || die 'Another persistent/generated Swap unit exists.'
-    listing=$(systemctl list-units --all --plain --full --no-legend --no-pager) || die 'Cannot inspect loaded Swap units.'
-    while read -r unit load active sub rest; do
+swap_rows() {
+    awk '
+        NR==1 {if(NF!=5 || $1!="Filename" || $2!="Type" || $3!="Size" || $4!="Used" || $5!="Priority")bad=1; next}
+        NF!=5 || $1!~/^\// || ($2!="file" && $2!="partition") || $3!~/^[1-9][0-9]*$/ ||
+        $4!~/^[0-9]+$/ || $5!~/^-?[0-9]+$/ {bad=1; next}
+        {printf "%s\t%s\t%s\t%s\n",$1,$2,$3,$5}
+        END{if(!NR || bad)exit 1}' /proc/swaps
+}
+swap_inventory() {
+    local mode=$1 rows fstab listing unit rest result=none
+    rows=$(swap_rows) || die '无法完整读取活动 Swap。'
+    if [[ -n $rows ]]; then
+        if [[ $mode == owned ]]; then
+            [[ $rows != *$'\n'* && $rows == "$SWAP_FILE"$'\tfile\t'* ]] || die '发现其他活动 Swap，未停用或替换。'
+        fi
+        result=active
+    fi
+    if [[ -e /etc/fstab || -L /etc/fstab ]]; then
+        [[ -f /etc/fstab && -r /etc/fstab ]] || die '无法读取 /etc/fstab 的 Swap 配置。'
+        fstab=$(awk '$1!~/^#/ && $3=="swap" {found=1} END{print found?"yes":"no"}' /etc/fstab) ||
+            die '无法检查 /etc/fstab 的 Swap 配置。'
+        if [[ $fstab == yes ]]; then
+            [[ $mode == new ]] || die '发现已有 fstab Swap，未修改其配置。'
+            if [[ $result == none ]]; then result=configured; fi
+        fi
+    fi
+    # list-unit-files without a type filter also works on a system with no Swap.
+    listing=$(systemctl list-unit-files --full --no-legend --no-pager &&
+        systemctl list-units --all --type=swap --plain --full --no-legend --no-pager) || die '无法读取 systemd 的 Swap 单元。'
+    while read -r unit rest; do
         [[ $unit == *.swap ]] || continue
-        [[ $mode == owned && $unit == "$SWAP_UNIT" ]] || die "Unexpected loaded Swap unit: $unit"
+        if [[ $mode == owned ]]; then
+            [[ $unit == "$SWAP_UNIT" ]] || die "发现其他 Swap 单元：$unit"
+        else
+            [[ $unit != "$SWAP_UNIT" ]] || die "已有单元占用了本工具的 Swap 名称：$unit"
+            if [[ $result == none ]]; then result=configured; fi
+        fi
     done <<< "$listing"
+    printf '%s\n' "$result"
+}
+swap_check_tuning_conflicts() {
+    local mode=$1 file value status
     if [[ -e /sys/module/zswap/parameters/enabled ]]; then
-        value=$(cat /sys/module/zswap/parameters/enabled)
+        value=$(cat /sys/module/zswap/parameters/enabled) || die '无法读取 zswap 状态。'
         [[ $value == N || $value == n || $value == 0 ]] || die 'Existing compressed Swap cache is enabled; this disk-only policy does not change it automatically.'
     fi
     for file in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
@@ -1288,8 +1393,11 @@ swap_no_conflicts() {
     done
 }
 swap_inspect_owned() {
-    local file
-    safe_swap_dir "$SWAP_DIR" && [[ $(stat -c %a -- "$SWAP_DIR") == 700 && $(stat -c %d -- "$SWAP_DIR") == "$(stat -c %d -- /var/lib)" ]] || die 'Unsafe or separately mounted persistent Swap directory.'
+    local file directory_device parent_device
+    safe_swap_dir "$SWAP_DIR" && [[ $(stat -c %a -- "$SWAP_DIR") == 700 ]] || die 'Unsafe persistent Swap directory.'
+    directory_device=$(stat -c %d -- "$SWAP_DIR") && parent_device=$(stat -c %d -- /var/lib) ||
+        die 'Cannot identify the persistent Swap directory filesystem.'
+    [[ $directory_device == "$parent_device" ]] || die 'Persistent Swap directory is mounted on a separate filesystem.'
     plain_root_file "$SWAP_OWNER" && [[ $(stat -c %h -- "$SWAP_OWNER") == 1 && $(stat -c %a -- "$SWAP_OWNER") == 644 ]] &&
         cmp -s "$SWAP_OWNER" <(swap_owner_content) || die 'Disk Swap ownership record differs; no file was adopted.'
     for file in "$SWAP_DIR"/* "$SWAP_DIR"/.[!.]* "$SWAP_DIR"/..?*; do
@@ -1297,10 +1405,10 @@ swap_inspect_owned() {
         case $file in "$SWAP_OWNER"|"$SWAP_FILE") plain_root_file "$file" || die 'Unsafe owned Swap file.' ;; *) die "Unknown persistent Swap directory entry: $file" ;; esac
     done
 }
-swap_preflight() {
-    local mode=$1 file free allocated=0 directory
-    swap_filesystem_check
-    swap_no_conflicts "$mode"
+swap_check_paths() {
+    local mode=$1 file directory
+    safe_swap_dir /var/lib && safe_swap_dir /etc/systemd/system && safe_swap_dir /etc/sysctl.d ||
+        die 'Swap 配置目录的归属或路径不安全。'
     for directory in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
         [[ ! -e $directory/$SWAP_UNIT.d && ! -L $directory/$SWAP_UNIT.d ]] || die "Existing Swap unit override directory: $directory/$SWAP_UNIT.d"
         if [[ $directory != /etc/systemd/system ]]; then
@@ -1315,20 +1423,76 @@ swap_preflight() {
         if [[ -e $SWAP_DIR || -L $SWAP_DIR ]]; then swap_inspect_owned; fi
         if [[ -e $SWAP_UNIT_FILE || -L $SWAP_UNIT_FILE ]]; then plain_root_file "$SWAP_UNIT_FILE" && cmp -s "$SWAP_UNIT_FILE" <(swap_unit_content) || die 'Existing disk Swap unit conflicts.'; fi
     fi
-    if [[ -e $SWAP_FILE || -L $SWAP_FILE ]]; then
-        plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]:--} != - && $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 ]] || die 'An unrecorded or changed partial Swap file remains; retain it for inspection.'
-        allocated=$(stat -c %b -- "$SWAP_FILE"); allocated=$((allocated*512))
+}
+swap_free_kib() {
+    local free
+    free=$(df -k --output=avail -- /var/lib | awk 'NR==2{print $1}') || die '无法读取 /var/lib 的剩余磁盘空间。'
+    [[ $free =~ ^(0|[1-9][0-9]{0,14})$ ]] || die '/var/lib 的剩余磁盘空间读数异常。'
+    printf '%s\n' "$free"
+}
+swap_usable_kib() {
+    local bytes=$1 page
+    page=$(getconf PAGESIZE) || die '无法读取系统页大小。'
+    [[ $page =~ ^[1-9][0-9]{3,5}$ ]] &&
+        (( page % 1024 == 0 && (page & (page - 1)) == 0 && bytes % page == 0 &&
+           bytes / page >= 10 && bytes / page <= SWAP_MAX_PAGES )) ||
+        die '目标容量超出单个 Swap 文件支持的页数，未开始分配。'
+    printf '%s\n' "$(((bytes - page) / 1024))"
+}
+swap_plan() {
+    local memory=$1 bytes=$2 existing type free need
+    swap_check_paths new || return 1
+    swap_require_writable_varlib || return 1
+    existing=$(swap_inventory new) || return 1
+    if [[ $existing != none ]]; then
+        [[ $existing == active ]] || (( memory > KIB_PER_GIB )) ||
+            die '系统已有 Swap 配置，但当前没有活动 Swap。低内存机器请先确认该配置并启用后重试。'
+        printf 'preserve\n'
+        return
     fi
-    free=$(df -Pk /var/lib | awk 'END{print $4}')
-    [[ $free =~ ^[0-9]+$ ]] && ((free*1024+allocated>=SWAP_BYTES+SWAP_RESERVE_KIB*1024)) || die 'Need space for the 1 GiB Swap file plus 1 GiB filesystem reserve.'
+    swap_check_tuning_conflicts new || return 1
+    swap_usable_kib "$bytes" >/dev/null || return 1
+    type=$(swap_mount_field FSTYPE) || return 1
+    if [[ $type != ext4 ]]; then
+        (( memory > KIB_PER_GIB )) || die "低内存机器需要可写的本地 ext4 文件系统创建 Swap，当前 /var/lib 为 $type。"
+        printf 'skip-filesystem\n'
+        return
+    fi
+    swap_ext4_device_check || return 1
+    free=$(swap_free_kib) || return 1
+    # Leave a small allowance for task files and filesystem allocation
+    # metadata. The actual reserve is checked after writing the file.
+    need=$((bytes / 1024 + SWAP_RESERVE_KIB + SWAP_PREPARE_KIB))
+    if (( free < need )); then
+        (( memory > KIB_PER_GIB )) || die "创建 Swap 并保留余量需要 $need KiB，/var/lib 目前只有 $free KiB 空闲。"
+        printf 'skip-space\n'
+        return
+    fi
+    printf 'disk\n'
+}
+swap_require_owned_file() {
+    local current bytes=${S[swap_bytes]}
+    plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]} != - && $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" &&
+        $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 ]] ||
+        die '本任务的 Swap 文件归属或权限已变化，已保留现场。'
+    current=$(stat -c %s -- "$SWAP_FILE") || die '无法读取 Swap 文件大小。'
+    [[ $current =~ ^(0|[1-9][0-9]{0,17})$ ]] && (( current <= bytes )) ||
+        die '本任务的 Swap 文件大小异常，未覆盖文件。'
+}
+swap_allocated_kib() {
+    local blocks
+    blocks=$(stat -c %b -- "$SWAP_FILE") || die '无法读取 Swap 文件已分配的空间。'
+    [[ $blocks =~ ^(0|[1-9][0-9]{0,14})$ ]] || die 'Swap 文件已分配空间的读数异常。'
+    printf '%s\n' "$((blocks / 2))"
 }
 swap_verify_file() {
-    local blocks
-    swap_inspect_owned
-    plain_root_file "$SWAP_FILE" && [[ ${S[swap_identity]} != - && $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") == "$SWAP_BYTES" ]] || die 'Owned Swap identity, size or permissions changed.'
-    blocks=$(stat -c %b -- "$SWAP_FILE")
-    [[ $blocks =~ ^[0-9]+$ ]] && ((blocks*512>=SWAP_BYTES)) || die 'Swap allocation is incomplete or sparse.'
-    [[ $(blkid -p -s TYPE -o value -- "$SWAP_FILE") == swap && $(blkid -p -s UUID -o value -- "$SWAP_FILE") == "${S[swap_uuid]}" ]] || die 'Owned Swap signature differs.'
+    local allocated bytes=${S[swap_bytes]}
+    swap_inspect_owned; swap_require_owned_file
+    [[ $(stat -c %s -- "$SWAP_FILE") == "${S[swap_bytes]}" ]] || die 'Swap 文件大小与目标不一致。'
+    allocated=$(swap_allocated_kib) || return 1
+    (( allocated >= bytes / 1024 )) || die 'Swap 文件分配不完整或含有空洞。'
+    [[ $(blkid -p -s TYPE -o value -- "$SWAP_FILE") == swap && $(blkid -p -s UUID -o value -- "$SWAP_FILE") == "${S[swap_uuid]}" ]] ||
+        die 'Swap 文件签名与本任务记录不一致。'
 }
 publish_swap_directory() {
     local stage=$BASE/swap-staged marker file item device parent_device bytes identity
@@ -1375,62 +1539,104 @@ publish_swap_directory() {
 verify_swap_definition() {
     # Verify systemd's fully merged definition, including type-wide and prefix
     # drop-ins, before enabling or starting the unit. No active state is needed.
-    [[ $(systemctl show "$SWAP_UNIT" -p FragmentPath --value) == "$SWAP_UNIT_FILE" && $(systemctl show "$SWAP_UNIT" -p What --value) == "$SWAP_FILE" && $(systemctl show "$SWAP_UNIT" -p Priority --value) == 10 && -z $(systemctl show "$SWAP_UNIT" -p DropInPaths --value) ]] || die 'Loaded disk Swap unit differs.'
+    local what priority
+    nv_task_require_unit_definition "$SWAP_UNIT" "$SWAP_UNIT_FILE"
+    what=$(systemctl show "$SWAP_UNIT" -p What --value) && priority=$(systemctl show "$SWAP_UNIT" -p Priority --value) ||
+        die '无法读取 systemd 生效的 Swap 路径和优先级。'
+    [[ $what == "$SWAP_FILE" && $priority == 10 ]] || die 'Loaded disk Swap unit differs.'
+}
+verify_live_swap() {
+    local rows usable
+    systemctl is-active --quiet "$SWAP_UNIT" || die '本任务的 Swap 未启用。'
+    rows=$(swap_rows) || die '无法读取 Swap 的活动状态。'
+    usable=$(swap_usable_kib "${S[swap_bytes]}") || return 1
+    [[ $rows == "$SWAP_FILE"$'\tfile\t'"$usable"$'\t10' ]] || die '已启用 Swap 的路径、可用容量或优先级与预期不一致。'
 }
 verify_swap() {
-    local page
-    swap_filesystem_check; swap_no_conflicts owned; swap_verify_file
+    local inventory current
+    swap_filesystem_check; swap_check_paths owned; swap_check_tuning_conflicts owned
+    inventory=$(swap_inventory owned) && [[ $inventory == active ]] || die '本任务的 Swap 未在活动列表中。'
+    swap_verify_file
     plain_root_file "$SWAP_UNIT_FILE" && cmp -s "$SWAP_UNIT_FILE" <(swap_unit_content) || die 'Persistent Swap unit differs.'
     plain_root_file "$SWAP_SYSCTL" && cmp -s "$SWAP_SYSCTL" <(swap_sysctl_content) || die 'Persistent Swap parameter differs.'
     [[ $(systemctl is-enabled "$SWAP_UNIT") == enabled && -L /etc/systemd/system/swap.target.wants/$SWAP_UNIT && $(readlink -e -- /etc/systemd/system/swap.target.wants/"$SWAP_UNIT") == "$SWAP_UNIT_FILE" ]] || die 'Swap is not persistently enabled.'
-    systemctl is-active --quiet "$SWAP_UNIT" || die 'Owned disk Swap is not active.'
     verify_swap_definition
-    page=$(getconf PAGESIZE)
-    [[ $page =~ ^[1-9][0-9]*$ ]] || die 'Cannot read system page size.'
-    awk -v disk="$SWAP_FILE" -v size="$(((SWAP_BYTES-page)/1024))" 'NR>1{n++;if(NF!=5 || $1!=disk || $2!="file" || $3!=size || $5!=10)bad=1} END{exit(bad || n!=1)}' /proc/swaps || die 'Active disk Swap capacity or priority differs.'
-    [[ $(sysctl -n vm.swappiness) == 10 ]] || die 'Live swappiness differs from 10.'
+    verify_live_swap
+    current=$(sysctl -n vm.swappiness) && [[ $current == 10 ]] || die '无法确认当前 swappiness 为 10。'
+}
+swap_summary() {
+    local bytes=${S[swap_bytes]:-$BYTES_PER_GIB} gib
+    gib=$((bytes / BYTES_PER_GIB))
+    case ${S[swap_policy]} in
+        disk|disk1g)
+            case ${S[swap_status]} in
+                verified) printf '磁盘 Swap：%s GiB，重启核验通过。\n' "$gib" ;;
+                active) printf '磁盘 Swap：%s GiB，已启用，等待重启核验。\n' "$gib" ;;
+                *) printf '计划创建 %s GiB 磁盘 Swap。预检需 %s GiB 加 %s MiB 空闲，用于保留磁盘余量及保存任务文件。\n' \
+                    "$gib" "$((gib + SWAP_RESERVE_KIB / KIB_PER_GIB))" "$((SWAP_PREPARE_KIB / 1024))" ;;
+            esac ;;
+        preserve) printf 'Swap：保留系统已有的 Swap 配置和参数。\n' ;;
+        skip-space) printf 'Swap：/var/lib 空间不足，跳过计划的 %s GiB Swap。\n' "$gib" ;;
+        skip-filesystem) printf 'Swap：/var/lib 文件系统不支持自动创建，跳过计划的 %s GiB Swap。\n' "$gib" ;;
+        skip) printf 'Swap：已按旧版策略跳过新建。\n' ;;
+    esac
 }
 phase_swap() {
-    local active=no status
-    if [[ ${S[swap_policy]} == skip ]]; then
-        S[swap_status]=skipped; S[phase]=update; save_state
-        note '实际内存大于 1GiB：不新建 Swap，保留已有内存设置。'
-        return 0
-    fi
+    local plan inventory free allocated need bytes=${S[swap_bytes]}
     if [[ ${S[swap_status]} == pending ]]; then
-        swap_preflight new
-        S[swap_uuid]=$(cat /proc/sys/kernel/random/uuid); S[swap_status]=building; save_state
+        # Recheck the decision immediately before the first Swap write. The
+        # target size was already committed and does not depend on live RAM.
+        plan=$(swap_plan "${S[mem_kib]}" "$bytes") || die 'Swap 预检未通过，尚未创建 Swap。'
+        S[swap_policy]=$plan
+        note "$(swap_summary)"
+        if [[ $plan != disk ]]; then
+            if [[ $plan == preserve ]]; then S[swap_status]=preserved; else S[swap_status]=skipped; fi
+            S[phase]=update; save_state
+            return 0
+        fi
+        S[swap_uuid]=$(cat /proc/sys/kernel/random/uuid) || die '无法生成 Swap 标识。'
+        S[swap_status]=building; save_state
     fi
-    swap_preflight owned
-    if [[ ! -e $SWAP_DIR && ! -L $SWAP_DIR ]]; then
-        publish_swap_directory
-    else
-        [[ ! -e $BASE/swap-staged && ! -L $BASE/swap-staged ]] || die 'Both staged and final Swap directories exist.'
-    fi
-    swap_inspect_owned
-    if awk -v file="$SWAP_FILE" 'NR>1 && $1==file{found=1} END{exit !found}' /proc/swaps; then active=yes
-    else status=$?; [[ $status == 1 ]] || die 'Cannot read the current Swap table.'; fi
-    if [[ $active == yes ]]; then
+    if [[ ${S[swap_status]} != active ]]; then
+        swap_filesystem_check; swap_check_paths owned; swap_check_tuning_conflicts owned
+        swap_usable_kib "$bytes" >/dev/null
+        if [[ ${S[swap_status]} == building ]]; then
+            if [[ ! -e $SWAP_DIR && ! -L $SWAP_DIR ]]; then
+                publish_swap_directory
+            else
+                [[ ! -e $BASE/swap-staged && ! -L $BASE/swap-staged ]] || die 'Both staged and final Swap directories exist.'
+            fi
+            swap_require_owned_file
+            free=$(swap_free_kib); allocated=$(swap_allocated_kib)
+            need=$((bytes / 1024))
+            if (( allocated > need )); then allocated=$need; fi
+            (( free >= need - allocated + SWAP_RESERVE_KIB )) || die '磁盘空间已不足，保留本任务的 Swap 文件以便恢复。'
+            inventory=$(swap_inventory owned) && [[ $inventory == none ]] || die '已有活动或冲突 Swap，未写入 Swap 文件。'
+            dd if=/dev/zero of="$SWAP_FILE" bs=1048576 count="$((bytes / 1048576))" conv=fsync status=progress
+            mkswap -U "${S[swap_uuid]}" -- "$SWAP_FILE"
+            sync -f "$SWAP_FILE"
+            swap_verify_file
+            S[swap_status]=prepared; save_state
+        fi
+        # A verified prepared file can be reused even if power was lost
+        # before making the unit persistent. It must never be rewritten here.
         swap_verify_file
-    else
-        plain_root_file "$SWAP_FILE" && [[ $(swap_file_identity "$SWAP_FILE") == "${S[swap_identity]}" && $(stat -c %a -- "$SWAP_FILE") == 600 && $(stat -c %h -- "$SWAP_FILE") == 1 && $(stat -c %s -- "$SWAP_FILE") -le $SWAP_BYTES ]] || die 'Partial Swap identity differs.'
-        # Never overwrite an active Swap. Recheck immediately before construction.
-        awk -v file="$SWAP_FILE" 'NR>1 && $1==file{bad=1} END{exit bad}' /proc/swaps || die 'Swap became active during construction.'
-        dd if=/dev/zero of="$SWAP_FILE" bs=1048576 count=1024 conv=fsync status=progress
-        mkswap -U "${S[swap_uuid]}" -- "$SWAP_FILE"
-        swap_verify_file
+        free=$(swap_free_kib)
+        (( free >= SWAP_RESERVE_KIB )) || die 'Swap 已分配，但磁盘余量不足 1 GiB；请释放空间后恢复。'
+        swap_inventory owned >/dev/null
+        publish_config "$SWAP_UNIT_FILE" "$(swap_unit_content)"
+        systemctl daemon-reload
+        verify_swap_definition
+        systemctl start "$SWAP_UNIT"
+        verify_live_swap
+        systemctl enable "$SWAP_UNIT"
+        publish_config "$SWAP_SYSCTL" "$(swap_sysctl_content)"
+        sysctl -w vm.swappiness=10
+        S[swap_status]=active; dirty
     fi
-    publish_config "$SWAP_UNIT_FILE" "$(swap_unit_content)"
-    systemctl daemon-reload
-    verify_swap_definition
-    systemctl enable --now "$SWAP_UNIT"
-    systemctl is-active --quiet "$SWAP_UNIT" || die 'Owned disk Swap is not active.'
-    publish_config "$SWAP_SYSCTL" "$(swap_sysctl_content)"
-    sysctl -w vm.swappiness=10
-    S[swap_status]=active; dirty
     verify_swap
     S[phase]=update; save_state
-    note '已启用 1GiB Swap，优先级 10、swappiness=10；稍后会重启检查是否持久生效。'
+    note "$(swap_summary)"
 }
 phase_update() {
     check_resources; strict_update
@@ -1644,11 +1850,12 @@ balloon_kernel_mode() {
     case $value in CONFIG_VIRTIO_BALLOON=m) printf 'module\n' ;; '# CONFIG_VIRTIO_BALLOON is not set') printf 'absent\n' ;; CONFIG_VIRTIO_BALLOON=y) printf 'builtin\n' ;; *) return 1 ;; esac
 }
 verify_balloon() {
-    local mode
+    local mode probe
     mode=$(balloon_kernel_mode) || die 'Cannot read a definitive balloon kernel configuration.'
     if [[ ${S[balloon]} == module ]]; then
         [[ $mode == module ]] && cmp -s "$BALLOON_CONF" <(balloon_content) || die 'Balloon persistent configuration differs.'
-        [[ $(modprobe -n -v virtio_balloon) == 'install /bin/false '* || $(modprobe -n -v virtio_balloon) == 'install /bin/false' ]] || die 'Balloon load prevention is not effective.'
+        probe=$(modprobe -n -v virtio_balloon) || die 'Cannot inspect the balloon module load rule.'
+        [[ $probe == 'install /bin/false '* || $probe == 'install /bin/false' ]] || die 'Balloon load prevention is not effective.'
     else [[ $mode == absent ]] || die 'Balloon driver state changed.'; fi
     [[ ! -d /sys/module/virtio_balloon ]] || die 'Balloon module is still loaded after reboot.'
 }
@@ -1675,7 +1882,7 @@ verify_configuration() {
     ntp_observe; ntp_warning
     verify_balloon; verify_fail2ban
     cmp -s "$JAIL" <(jail_content) || die 'SSH jail persistent file differs.'
-    if [[ ${S[swap_policy]} == disk1g ]]; then
+    if [[ ${S[swap_policy]} == disk ]]; then
         [[ ${S[swap_status]} == active || ${S[swap_status]} == verified ]] || die 'Disk Swap preparation is incomplete.'
         verify_swap
     fi
@@ -1685,7 +1892,7 @@ verify_all() {
     check_candidate "${S[kernel_meta]}"; check_candidate "linux-image-${S[target_kernel]}"
     local pkg pending
     for pkg in curl ca-certificates kmod tzdata fail2ban nftables; do check_candidate "$pkg"; done
-    if [[ ${S[swap_policy]} == disk1g ]]; then check_candidate util-linux; fi
+    if [[ ${S[swap_policy]} == disk ]]; then check_candidate util-linux; fi
     pending=$(apt_run -s dist-upgrade --no-remove)
     if grep -q '^Inst ' <<< "$pending"; then die 'Package indexes now contain further upgrades; no success was declared.'; fi
 }
@@ -1693,7 +1900,7 @@ snapshot_result() {
     local -a files=(/etc/hostname /etc/localtime "$JAIL") packages=(curl ca-certificates kmod tzdata fail2ban nftables "${S[kernel_meta]}" "linux-image-${S[target_kernel]}")
     local config_hashes package_versions pkg
     [[ ${S[balloon]} != module ]] || files+=("$BALLOON_CONF")
-    if [[ ${S[swap_policy]} == disk1g ]]; then files+=("$SWAP_OWNER" "$SWAP_UNIT_FILE" "$SWAP_SYSCTL"); packages+=(util-linux); fi
+    if [[ ${S[swap_policy]} == disk ]]; then files+=("$SWAP_OWNER" "$SWAP_UNIT_FILE" "$SWAP_SYSCTL"); packages+=(util-linux); fi
     for pkg in "${packages[@]}"; do installed "$pkg" || die "Package is not fully installed: $pkg"; done
     config_hashes=$(sha256sum -- "${files[@]}" | sha256sum | awk '{print $1}') || die 'Cannot read all verified configuration files.'
     package_versions=$(dpkg-query -W -f='${binary:Package}=${Version},' "${packages[@]}") || die 'Cannot read all verified package versions.'
@@ -1709,8 +1916,8 @@ phase_final() {
     official_apt_ready || die 'The original official APT indexes are unavailable. Use --resume to repeat the update and recheck the selected kernel.'
     if [[ ${S[last_config_boot]} == "$(boot_id)" ]]; then request_reboot final; fi
     verify_all
-    if [[ ${S[swap_policy]} == disk1g ]]; then S[swap_status]=verified; fi
     snapshot_result
+    if [[ ${S[swap_policy]} == disk ]]; then S[swap_status]=verified; fi
     S[phase]=cleanup; S[result_status]=cleanup_pending
     save_state; write_state_to "$RESULT"
 }
@@ -1822,6 +2029,7 @@ on_worker_error() {
 worker_main() {
     [[ $0 == "$WORKER" ]] || die 'Worker must run from its managed path.'
     plain_root_file "$STATE_FILE" && parse_state "$STATE_FILE" || die 'Invalid or unsafe state file.'
+    [[ ${S[format]} == 4 ]] || die '旧任务必须使用原版本脚本恢复。'
     [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'State belongs to another machine.'
     [[ ${S[failed]} == no ]] || die 'Previous failure requires repair and an explicit --resume; no automatic retry.'
     trap 'on_worker_error "$?"' ERR
@@ -1831,6 +2039,8 @@ worker_main() {
     trap 'on_worker_error 129' HUP
     trap 'on_worker_error 130' INT
     check_os; verify_task_files; discard_interrupted_state_write
+    plain_root_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die '后台初始化服务文件与本任务不一致。'
+    nv_task_require_unit_definition "$UNIT" "$UNIT_FILE"
     consume_reboot
     while :; do
         nv_ui_progress "${S[phase]}"
@@ -1845,6 +2055,7 @@ worker_main() {
 print_status() {
     nv_ui_heading "next-vps-setup $VERSION · 初始化状态"
     printf '当前阶段：%s\n机器名：%s\nSSH 端口：%s\n目标内核：%s\n已请求重启：%s 次\n' "$(nv_ui_stage_name "${S[phase]}")" "${S[hostname]}" "${S[ssh_port]}" "${S[target_kernel]}" "${S[reboot_count]}"
+    swap_summary
     if [[ ${S[failed]} == yes ]]; then
         printf '%s\n' '结果：未完成，任务已停止。请先查看日志，再使用同一版本恢复。'
         printf '  tail -n 100 %s/next-vps-setup.log\n' "$BASE"
@@ -1866,7 +2077,7 @@ launch_worker() {
     trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
     plain_root_file "$UNIT_FILE" && cmp -s "$UNIT_FILE" <(unit_content) || die 'Temporary service identity differs; it was not started.'
     systemctl daemon-reload || die 'Cannot reload the initialization service definition.'
-    [[ $(systemctl show "$UNIT" -p FragmentPath --value) == "$UNIT_FILE" && -z $(systemctl show "$UNIT" -p DropInPaths --value) ]] || die 'Merged initialization service definition has an unexpected source or overrides; it was not started.'
+    nv_task_require_unit_definition "$UNIT" "$UNIT_FILE"
     systemctl enable "$UNIT" || die 'Cannot enable initialization after reboot.'
     systemctl reset-failed "$UNIT" || die 'Cannot reset the initialization service failure.'
     write_state_to "$RESULT"
@@ -1998,7 +2209,7 @@ prepare_cleanup_recovery() {
     launch_worker
 }
 initialize_task() {
-    local entry=$1 name port meta owner pkg hash memory policy_sha apt_root
+    local entry=$1 name port meta owner pkg hash memory swap_bytes swap_policy policy_sha apt_root
     meta=$(kernel_meta_for_abi "$(uname -r)") || die 'Unsupported kernel flavour; only Debian 13 stable cloud/standard amd64 kernels are supported.'
     safe_entry_path "$entry" || die 'Upload a root-owned, non-symlink copy under /root, not writable by other users.'
     [[ ! -e $BASE && ! -L $BASE && ! -e $UNIT_FILE && ! -L $UNIT_FILE ]] || die 'Unknown task files exist; no files were overwritten.'
@@ -2019,16 +2230,18 @@ initialize_task() {
     installed "$pkg" || die 'Running kernel is not owned by the expected Debian kernel package.'
     owner=$(dpkg-query -W -f='${Maintainer}' "$pkg")
     [[ $owner == *'Debian Kernel Team'* ]] || die 'Unknown kernel package maintainer.'
-    memory=$(memtotal); memory_policy "$memory" >/dev/null || die 'Invalid memory size.'
-    if (( memory <= 1048576 )); then swap_preflight new; fi
+    memory=$(memtotal) && swap_bytes=$(swap_target_bytes "$memory") || die '无法读取有效的 MemTotal。'
+    swap_policy=$(swap_plan "$memory" "$swap_bytes") || die 'Swap 预检未通过，系统初始化尚未开始。'
     hash=$(file_sha "$entry")
     policy_sha=$(ssh_policy_sha) || die 'Cannot read the effective SSH authentication policy.'
-    S=([format]=3 [task_id]="$(cat /proc/sys/kernel/random/uuid)" [machine_id]="$(cat /etc/machine-id)"
+    S=([format]=4 [task_id]="$(cat /proc/sys/kernel/random/uuid)" [machine_id]="$(cat /etc/machine-id)"
        [hostname]="$name" [ssh_port]="$port" [kernel_meta]="$meta" [target_kernel]=- [ntp_unit]="$(detect_ntp)"
-       [balloon]=pending [swap_policy]="$(memory_policy "$memory")" [swap_status]=pending [swap_uuid]=- [swap_identity]=- [mem_kib]="$memory" [phase]=swap
+       [balloon]=pending [swap_policy]="$swap_policy" [swap_bytes]="$swap_bytes" [swap_status]=pending [swap_uuid]=- [swap_identity]=- [mem_kib]="$memory" [phase]=swap
        [boot_before]=- [last_config_boot]="$(boot_id)" [reboot_count]=0 [reboot_wait]=none [failed]=no
        [entry_path]="$entry" [entry_identity]="$(file_identity "$entry")" [entry_sha]="$hash" [worker_sha]="$hash"
        [ssh_policy_sha]="$policy_sha" [result_status]=running [verified_boot]=- [verified_at]=0 [config_hashes]=- [packages]=- [ntp_status]=pending)
+    printf '系统内存：%s KiB\n' "$memory"
+    swap_summary
     trap 'on_worker_error "$?"' ERR
     trap 'code=$?; if ((code!=0)); then on_worker_error "$code"; fi' EXIT
     trap 'on_worker_error 143' TERM; trap 'on_worker_error 129' HUP; trap 'on_worker_error 130' INT
@@ -2064,6 +2277,7 @@ main() {
     entry=$(readlink -e -- "$0") || die 'Execute a regular local file, not stdin or a pipe.'
     if [[ -e $STATE_FILE || -L $STATE_FILE ]]; then
         plain_root_file "$STATE_FILE" && parse_state "$STATE_FILE" || die 'Unsupported or invalid task state; this version cannot resume a different release. No state was changed.'
+        [[ ${S[format]} == 4 ]] || die '旧任务必须使用原版本脚本恢复。'
         [[ ${S[machine_id]} == "$(cat /etc/machine-id)" ]] || die 'State belongs to another machine.'
         print_status
         if [[ $mode == --resume ]]; then

@@ -1,6 +1,6 @@
 # next-vps-setup
 
-**V1.5 · 一键 VPS 初始化，适用于 Debian 13。**
+**2.0 · 一键 VPS 初始化，适用于 Debian 13。**
 
 新装系统使用 `next-vps-setup.sh`；以后更新内核使用 `next-vps-kernel-update.sh`。
 
@@ -31,10 +31,13 @@
 | 时间同步 | 尽力启用，无法同步时提醒并继续 |
 | SSH 防护 | Fail2ban：同一来源10分钟内匹配5次失败事件，永久封禁 |
 | 气球驱动 | 禁止模块式 `virtio_balloon` 加载并重启检查，发现内建的 `virtio_balloon` 时停止 |
-| 实际内存≤1GiB | 创建1GiB磁盘 Swap，`swappiness=10`、优先级10 |
-| 实际内存>1GiB | 不新建 Swap，不接管已有内存策略 |
+| 磁盘 Swap | 按系统识别的内存向上取整到整 GiB，至少 1 GiB。新建时设为 `swappiness=10`、优先级 `10` |
 
-内存按 `MemTotal` 判断。低内存机器创建 Swap 需要本地可写的 ext4，已有 Swap 或冲突配置时会停止。开始前，根分区需至少 2GiB 空闲和 10,000 个空闲 inode，`/boot` 需至少 200MiB 空闲，可用内存需至少 128MiB。Swap 所在分区需能容纳 1GiB 文件并留出 1GiB 余量。
+容量以系统的 `MemTotal` 为准。例如 512 MiB 或 890 MiB 配 1 GiB，1.5 GiB 配 2 GiB，2.5 GiB 配 3 GiB。已有 Swap 会保留。内存不超过 1 GiB 且已有 Swap 配置未启用时，请先确认并启用该配置。
+
+新建 Swap 需要本地可写的 ext4。预检要求 `/var/lib` 所在分区容纳目标容量，再留 1 GiB 磁盘余量和 16 MiB 准备空间。遇到空间不足或文件系统不支持创建时，内存大于 1 GiB 的机器会跳过新建并继续其他初始化。内存不超过 1 GiB 且无活动 Swap 的机器会在写盘前停止。
+
+开始前，根分区需至少 2 GiB 空闲和 10,000 个空闲 inode，`/var/lib` 需至少 1 GiB 空闲，`/boot` 需至少 200 MiB 空闲，可用内存需至少 128 MiB。同一分区的空间要求取较高值。
 
 ### 下载并运行
 
@@ -56,7 +59,7 @@ apt-get install -y --no-install-recommends --no-remove curl ca-certificates
   tmp=$(mktemp /root/.next-vps-setup.XXXXXX) || exit 1
   trap 'rm -f -- "$tmp"' EXIT
   curl -fL --retry 3 --connect-timeout 15 \
-    https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.5/next-vps-setup.sh -o "$tmp" &&
+    https://raw.githubusercontent.com/JJorigin/next-vps-setup/2.0/next-vps-setup.sh -o "$tmp" &&
   chmod 700 "$tmp" &&
   mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-setup.sh
 ) &&
@@ -70,14 +73,14 @@ bash /root/next-vps-setup.sh
   tmp=$(mktemp /root/.next-vps-setup.XXXXXX) || exit 1
   trap 'rm -f -- "$tmp"' EXIT
   curl -fL --retry 3 --connect-timeout 15 \
-    https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@1.5/next-vps-setup.sh -o "$tmp" &&
+    https://cdn.jsdelivr.net/gh/JJorigin/next-vps-setup@2.0/next-vps-setup.sh -o "$tmp" &&
   chmod 700 "$tmp" &&
   mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-setup.sh
 ) &&
 bash /root/next-vps-setup.sh
 ```
 
-也可以从 [V1.5 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/1.5) 下载脚本，上传到 `/root/next-vps-setup.sh`，再执行以下命令。
+也可以从 [2.0 发布页](https://github.com/JJorigin/next-vps-setup/releases/tag/2.0) 下载脚本，上传到 `/root/next-vps-setup.sh`，再执行以下命令。
 
 ```bash
 chmod 700 /root/next-vps-setup.sh &&
@@ -88,7 +91,7 @@ bash /root/next-vps-setup.sh
 
 ### 等待完成
 
-输入机器名和当前 SSH 端口后，任务在后台继续，期间可能多次重启，SSH 会断开。**请先等待约5～10分钟，再手动连接 SSH**；下载或更新较慢时需要更久。
+输入机器名和当前 SSH 端口后，任务在后台继续，期间可能多次重启，SSH 会断开。**首次断线后，可先等待约 5～10 分钟，再手动连接 SSH。** 创建大容量 Swap 或下载更新较慢时，初始化可能需要更久。
 
 任务成功或失败后，下次通过 SSH 直接登录 root（登录 Shell 为 Bash）会显示一次结果，随后自动清理通知文件。没有看到提示时，可查询结果文件。
 
@@ -96,7 +99,7 @@ bash /root/next-vps-setup.sh
 cat /var/lib/next-vps-setup-result.tsv
 ```
 
-只有 `phase done`、`result_status complete`、`failed no` 同时满足才表示完成。NTP 未同步会单独提醒，不代表其他步骤失败。
+只有 `phase done`、`result_status complete`、`failed no` 同时满足才表示完成。Swap 跳过和 NTP 未同步会单独提醒。需要查看当前启用的 Swap 时，运行 `swapon --show`。
 
 成功后清理本次脚本、后台任务和临时日志，保留系统配置、Swap、Fail2ban 数据库及结果文件。
 
@@ -111,7 +114,7 @@ cat /var/lib/next-vps-setup-result.tsv
   tmp=$(mktemp /root/.next-vps-kernel-update.XXXXXX) || exit 1
   trap 'rm -f -- "$tmp"' EXIT
   curl -fL --retry 3 --connect-timeout 15 \
-    https://raw.githubusercontent.com/JJorigin/next-vps-setup/1.5/next-vps-kernel-update.sh -o "$tmp" &&
+    https://raw.githubusercontent.com/JJorigin/next-vps-setup/2.0/next-vps-kernel-update.sh -o "$tmp" &&
   chmod 700 "$tmp" &&
   mv -T --no-copy --update=none-fail -- "$tmp" /root/next-vps-kernel-update.sh
 ) &&

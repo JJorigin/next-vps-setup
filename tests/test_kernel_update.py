@@ -119,6 +119,12 @@ UNIT_FILE=$FIXTURE_ROOT/unit.service
 BOOT_DIR=$FIXTURE_ROOT/boot
 PROC_DIR=$FIXTURE_ROOT/proc
 SYS_DIR=$FIXTURE_ROOT/sys
+mv() {
+    if [[ $# == 6 && $1 == -T && $2 == --no-copy && $3 == --update=none-fail && $4 == -- ]]; then
+        [[ $5 == "$FIXTURE_ROOT"/* && $6 == "$FIXTURE_ROOT"/* && ! -e $6 && ! -L $6 ]] || return 96
+        command mv -T -- "$5" "$6"
+    else command mv "$@"; fi
+}
 '''
         proc = subprocess.run(
             ["bash", "-c", bootstrap + "\n" + body, "test", *args],
@@ -165,6 +171,8 @@ SYS_DIR=$FIXTURE_ROOT/sys
             ("linux-image-rt-amd64", "6.12.0-9-rt-amd64"),
             ("linux-image-amd64", "6.12.0-9-rt-amd64"),
             (META, "6.12-cloud-amd64"),
+            ("linux-image-amd64", "6.12.115-custom-amd64"),
+            (META, "6.12.115-custom-cloud-amd64"),
         ]:
             with self.subTest(meta=meta, abi=abi):
                 self.assertNotEqual(self.run_bash('abi_ok "$1" "$2"', meta, abi, check=False).returncode, 0)
@@ -414,7 +422,7 @@ printf 'PRESERVED_OK\n'
 
     def test_ssh_boot_preflight_checks_persistent_target_socket_and_disable_marker(self) -> None:
         body = r'''
-MOCK_SERVICE=$1 MOCK_DEFAULT=$2 MOCK_LINK=$3 MOCK_SOCKET=$4 MOCK_MARKER=${5:-no}
+MOCK_SERVICE=$1 MOCK_DEFAULT=$2 MOCK_LINK=$3 MOCK_SOCKET=$4 MOCK_MARKER=${5:-no} MOCK_SOCKET_STATE=${6:-inactive}
 unit_dir=$(mktemp -d "$FIXTURE_ROOT/systemd.XXXXXX")
 ssh_dir=$unit_dir/ssh
 mkdir -p "$unit_dir/multi-user.target.wants" "$ssh_dir"
@@ -430,7 +438,9 @@ systemctl() {
         'get-default') printf '%s\n' "$MOCK_DEFAULT" ;;
         'show ssh.service -p FragmentPath --value') printf '%s\n' "$unit_dir/ssh.service" ;;
         'is-enabled ssh.socket') printf '%s\n' "$MOCK_SOCKET"; [[ $MOCK_SOCKET == enabled ]] ;;
-        'is-active --quiet ssh.socket') return 3 ;;
+        'show ssh.socket -p ActiveState --value')
+            [[ $MOCK_SOCKET_STATE != read-error ]] || return 1
+            printf '%s\n' "$MOCK_SOCKET_STATE" ;;
         *) die 'Unexpected systemctl call.' ;;
     esac
 }
@@ -444,10 +454,30 @@ nv_task_require_ssh_boot "$unit_dir" "$ssh_dir"
             ("enabled", "multi-user.target", "no", "disabled"),
             ("enabled", "multi-user.target", "yes", "enabled"),
             ("enabled", "multi-user.target", "yes", "disabled", "yes"),
+            ("enabled", "multi-user.target", "yes", "disabled", "no", "active"),
+            ("enabled", "multi-user.target", "yes", "disabled", "no", "read-error"),
         ):
             with self.subTest(case=case):
                 proc = self.run_bash(body, *case, check=False)
                 self.assertNotEqual(proc.returncode, 0)
+
+    def test_unit_definition_distinguishes_empty_dropins_from_read_failure(self) -> None:
+        body = r'''
+MODE=$1
+systemctl() {
+    case "$*" in
+        'show fixture.service -p FragmentPath --value') printf '%s\n' "$UNIT_FILE" ;;
+        'show fixture.service -p DropInPaths --all')
+            [[ $MODE != read-error ]] || return 52
+            printf 'DropInPaths=%s\n' "${MODE#empty}" ;;
+        *) return 97 ;;
+    esac
+}
+nv_task_require_unit_definition fixture.service "$UNIT_FILE"
+'''
+        self.run_bash(body, "empty")
+        for mode in ("read-error", "/etc/systemd/system/fixture.service.d/local.conf"):
+            self.assertNotEqual(self.run_bash(body, mode, check=False).returncode, 0)
 
     def test_post_boot_verification_keeps_approved_target_if_archive_advances(self) -> None:
         body = assignments(self.purge_state()) + r'''
@@ -1045,7 +1075,7 @@ systemctl() {
     printf 'service:%s\n' "$*" >> "$CALLS"
     case "$*" in
         *'FragmentPath'*) printf '%s\n' "$UNIT_FILE" ;;
-        *'DropInPaths'*) printf '\n' ;;
+        *'DropInPaths'*) printf 'DropInPaths=\n' ;;
         'start --no-block '*)
             if flock -n "$FIXTURE_ROOT" true; then return 96; fi
             return 41 ;;
@@ -1137,6 +1167,9 @@ cat() {
 }
 check_os() { :; }
 verify_owned() { :; }
+unit_content > "$UNIT_FILE"
+plain_file() { [[ $1 == "$UNIT_FILE" && -f $1 && ! -L $1 ]]; }
+nv_task_require_unit_definition() { :; }
 note() { :; }
 boot_id() { printf '%s\n' "$MOCK_BOOT"; }
 uname() { printf '%s\n' "$MOCK_RUNNING"; }

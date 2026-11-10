@@ -104,7 +104,7 @@ class UserInterfaceTests(unittest.TestCase):
 
     def test_key_stages_are_readable_and_unknown_stage_has_fallback(self) -> None:
         expectations = {
-            "swap": "准备小内存交换空间",
+            "swap": "检查和准备交换空间",
             "update": "更新 Debian 官方软件包和内核",
             "configure": "配置主机名、时区和 SSH 防护",
             "install": "下载并安装官方内核",
@@ -124,7 +124,7 @@ class UserInterfaceTests(unittest.TestCase):
             'nv_ui_launch "$1" "$2" "$3" "$4"',
             "内核维护", "3–10", "/var/lib/kernel-result.tsv", "/var/lib/task/run.log",
         )
-        self.assertIn("内核维护 · 后台任务已启动", output)
+        self.assertIn("内核维护 · 后台任务已提交", output)
         self.assertIn("自动重启", output)
         self.assertIn("SSH 连接会断开", output)
         self.assertIn("SSH 不会自动重连", output)

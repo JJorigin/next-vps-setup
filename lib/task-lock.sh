@@ -33,9 +33,18 @@ nv_task_show_unit_failure() {
     printf '结果：后台服务已失败。回执可能尚未更新，请查看服务日志。\n  journalctl -u %s -n 80 --no-pager\n' "$unit"
 }
 
+nv_task_require_unit_definition() {
+    local unit=$1 expected=$2 fragment dropins
+    fragment=$(systemctl show "$unit" -p FragmentPath --value) &&
+        dropins=$(systemctl show "$unit" -p DropInPaths --all) ||
+        die "无法读取 $unit 的 systemd 生效配置。"
+    [[ $fragment == "$expected" && $dropins == DropInPaths= ]] ||
+        die "$unit 的来源或覆盖配置与本任务不一致。"
+}
+
 # Check the normal Debian SSH boot path without changing its configuration.
 nv_task_require_ssh_boot() {
-    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state
+    local unit_dir=${1:-/etc/systemd/system} ssh_dir=${2:-/etc/ssh} state target fragment link socket_state socket_active
     [[ ! -e $ssh_dir/sshd_not_to_be_run && ! -L $ssh_dir/sshd_not_to_be_run ]] ||
         die 'Debian 的 SSH 禁用标记仍存在，自动重启后可能无法登录。'
     systemctl is-active --quiet ssh.service || die 'ssh.service 当前未运行。'
@@ -51,5 +60,8 @@ nv_task_require_ssh_boot() {
         socket_state=$(systemctl show ssh.socket -p LoadState --value) || die '无法读取 ssh.socket 的状态。'
     fi
     case $socket_state in disabled|masked|not-found) ;; *) die 'ssh.socket 已启用或无法核验其启动状态。' ;; esac
-    if systemctl is-active --quiet ssh.socket; then die '此工具要求 ssh.service 直接监听 SSH 端口。'; fi
+    if [[ $socket_state != not-found ]]; then
+        socket_active=$(systemctl show ssh.socket -p ActiveState --value) || die '无法确认 ssh.socket 的运行状态。'
+        [[ $socket_active == inactive || $socket_active == failed ]] || die '此工具要求 ssh.service 直接监听 SSH 端口。'
+    fi
 }

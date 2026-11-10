@@ -71,6 +71,10 @@ UNIT_FILE=$FIXTURE_ROOT/unit.service
 UNIT=fixture-init.service
 JAIL=$FIXTURE_ROOT/jail.local
 BALLOON_CONF=$FIXTURE_ROOT/balloon.conf
+KIB_PER_GIB=1048576
+BYTES_PER_GIB=1073741824
+SWAP_RESERVE_KIB=$KIB_PER_GIB
+SWAP_PREPARE_KIB=16384
 VERSION=fixture
 IN_REBOOT=no
 BOOTSTRAP_BASE_ID= BOOTSTRAP_TEMP= BOOTSTRAP_TEMP_ID=
@@ -115,6 +119,7 @@ check_resources() { :; }
 installed() { [[ $1 == linux-image-6.12.113+deb13-cloud-amd64 ]]; }
 dpkg-query() { printf 'Debian Kernel Team <debian-kernel@lists.debian.org>\n'; }
 memtotal() { printf '2097152\n'; }
+swap_plan() { printf 'disk\n'; }
 detect_ntp() { printf 'systemd-timesyncd.service\n'; }
 boot_id() { printf '22222222-2222-4222-8222-222222222222\n'; }
 ssh_policy_sha() { printf '%064d\n' 0; }
@@ -174,6 +179,7 @@ prepare_bootstrap_recovery /root/next-vps-setup.sh
         self.assertEqual((self.task / "owner").read_text(), TASK + "\n")
         self.assertEqual(self.read_state(self.state), self.read_state(self.result))
         self.assertEqual(self.read_state(self.result)["phase"], "swap")
+        self.assertEqual(self.read_state(self.result)["swap_bytes"], "2147483648")
         self.assertEqual(self.calls.read_text(), "LAUNCH\n")
 
     def test_cloud_init_pending_or_error_stops_before_persisting_task(self) -> None:
@@ -268,7 +274,7 @@ parse_state "$STATE_FILE"
 S[phase]=final; S[target_kernel]=6.12.113+deb13-cloud-amd64
 S[boot_before]=55555555-5555-4555-8555-555555555555
 S[reboot_count]=3; S[reboot_wait]=none; S[balloon]=module
-S[mem_kib]=524288; S[swap_policy]=disk1g; S[swap_uuid]=33333333-3333-4333-8333-333333333333
+S[mem_kib]=524288; S[swap_bytes]=1073741824; S[swap_policy]=disk; S[swap_uuid]=33333333-3333-4333-8333-333333333333
 S[swap_status]=active; S[swap_identity]=44444444-4444-4444-8444-444444444444:12345
 official_apt_ready() { return 0; }
 prepare_resume_plan
@@ -285,14 +291,13 @@ prepare_resume_plan
         fixture = r'''
 parse_state "$STATE_FILE"
 SWAP_DIR=$FIXTURE_ROOT/final-swap
-SWAP_BYTES=1073741824
 swap_mount_field() {
     [[ $1 == UUID ]] || return 97
     printf '44444444-4444-4444-8444-444444444444\n'
 }
 '''
         before = self.run_shell(fixture + r'''
-S[mem_kib]=524288; S[swap_policy]=disk1g; S[swap_status]=building
+S[mem_kib]=524288; S[swap_bytes]=1073741824; S[swap_policy]=disk; S[swap_status]=building
 S[swap_uuid]=33333333-3333-4333-8333-333333333333
 save_state
 mkdir -m 0700 -- "$BASE/swap-staged"
@@ -319,6 +324,61 @@ publish_swap_directory
 ''')
         self.assertFalse(staged.exists())
         self.assertEqual((self.root / "final-swap" / "swapfile").stat().st_ino, inode)
+
+    def test_prepared_swap_is_reused_and_verified_before_enabling_at_boot(self) -> None:
+        self.initialize()
+        self.run_shell(r'''
+parse_state "$STATE_FILE"
+SWAP_UNIT=fixture.swap
+SWAP_UNIT_FILE=$FIXTURE_ROOT/fixture.swap
+SWAP_SYSCTL=$FIXTURE_ROOT/fixture.conf
+SWAP_FILE=$FIXTURE_ROOT/swapfile
+S[swap_status]=prepared
+S[swap_uuid]=33333333-3333-4333-8333-333333333333
+S[swap_identity]=44444444-4444-4444-8444-444444444444:12345
+swap_filesystem_check() { :; }
+swap_check_paths() { :; }
+swap_check_tuning_conflicts() { :; }
+swap_usable_kib() { [[ $1 == 2147483648 ]]; }
+swap_verify_file() { :; }
+swap_free_kib() { printf '%s\n' "$SWAP_RESERVE_KIB"; }
+swap_inventory() { printf 'none\n'; }
+dd() { printf 'unexpected-write\n' >> "$DANGER_LOG"; return 97; }
+mkswap() { printf 'unexpected-format\n' >> "$DANGER_LOG"; return 97; }
+publish_config() { printf 'config:%s\n' "$1" >> "$CALLS"; }
+systemctl() { printf 'unit:%s\n' "$*" >> "$CALLS"; }
+verify_swap_definition() { :; }
+verify_live_swap() { printf 'live-verified\n' >> "$CALLS"; }
+sysctl() { printf 'sysctl:%s\n' "$*" >> "$CALLS"; }
+verify_swap() { :; }
+phase_swap
+''')
+        calls = self.calls.read_text().splitlines()
+        self.assertLess(calls.index("unit:start fixture.swap"), calls.index("live-verified"))
+        self.assertLess(calls.index("live-verified"), calls.index("unit:enable fixture.swap"))
+        self.assertLess(calls.index("unit:enable fixture.swap"), calls.index("sysctl:-w vm.swappiness=10"))
+        self.assertEqual(self.read_state(self.state)["swap_status"], "active")
+        self.assertEqual(self.read_state(self.state)["phase"], "update")
+
+    def test_only_a_completed_legacy_initializer_receipt_is_readable(self) -> None:
+        self.initialize()
+        self.run_shell(r'''
+parse_state "$STATE_FILE"
+S[format]=3
+unset 'S[swap_bytes]'
+S[swap_policy]=skip; S[swap_status]=skipped
+S[phase]=done; S[result_status]=complete; S[ntp_status]=unsynchronized
+S[target_kernel]=6.12.113+deb13-cloud-amd64; S[reboot_count]=1
+S[verified_boot]=33333333-3333-4333-8333-333333333333
+S[verified_at]=1790000000
+S[config_hashes]=$(printf '%064d' 0)
+S[packages]=curl=8.14.1-2,
+serialize_state > "$RESULT"
+parse_state "$RESULT"
+S[phase]=final; S[result_status]=running
+serialize_state > "$RESULT"
+if parse_state "$RESULT"; then exit 95; fi
+''')
 
     def test_owner_temporary_failure_removes_only_its_empty_directory(self) -> None:
         proc = self.initialize(r'''
@@ -380,6 +440,7 @@ mktemp() {
         # Only the fixture's /tmp ancestor is modeled as a trusted system
         # directory. No host permissions are changed by this rootless test.
         metadata = r'''
+source "$INIT_LIBRARY"
 stat() {
     if [[ ${1:-} == -c && ${2:-} == %a && ${!#} == /tmp ]]; then printf '755\n'
     elif [[ ${1:-} == -c && ${2:-} == %u && ${!#} == "$FIXTURE_ROOT"* ]]; then
